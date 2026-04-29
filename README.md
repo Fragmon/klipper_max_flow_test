@@ -227,11 +227,7 @@ melt_zone_length: 42             # ADAPT: hotend melt-zone length in mm (Sherpa 
 #min_hotend_temp: 180            # safety floor — test refuses to run below this
 #output_dir: ~/printer_data/config/Flowtest
 ```
-
-A complete sample config is in [`sample_config.cfg`](sample_config.cfg).
-
 ---
-
 ## ⚠️ Important: StealthChop required for StallGuard
 
 This plugin can only work when the extruder driver is in **StealthChop** mode. This is a hardware limitation of the TMC chips, not the plugin:
