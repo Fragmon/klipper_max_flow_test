@@ -58,7 +58,7 @@ Slicer recommendation:
 ```bash
 cd ~
 git clone https://github.com/Fragmon/klipper_max_flow_test.git
-ln -s ~/tmc_flow_test/tmc_flow_test.py ~/klipper/klippy/extras/tmc_flow_test.py
+ln -s ~/klipper_max_flow_test/tmc_flow_test.py ~/klipper/klippy/extras/tmc_flow_test.py
 ```
 
 Add the [configuration](#configuration) to your `printer.cfg`, then:
@@ -107,53 +107,58 @@ Both modes use median + IQR statistics over 5 repetitions per measurement (confi
 
 Pick the variant matching your driver and CoolStep preference. **Run the test with the same settings you use for actual printing** — don't toggle CoolStep just for the test.
 
+> ⚠️ **Adapt before pasting:** Lines marked with `# ADAPT` depend on your specific board, wiring and motor. Don't copy these blocks blindly — at minimum, set the right pins and current for your hardware. The other lines (StallGuard / CoolStep settings) are required by the plugin and should be kept as shown.
+
 #### TMC2240, CoolStep enabled (klipper_tmc_autotune default)
 
 ```ini
 [tmc2240 extruder]
-cs_pin: PA15
-spi_bus: spi4
-spi_speed: 2000000
-rref: 12300
-run_current: 0.85
-hold_current: 0.6
-interpolate: false
-stealthchop_threshold: 999999
-coolstep_threshold: 0.5
-driver_SEMIN: 5
-driver_SEMAX: 2
-driver_SEUP: 2
-driver_SEDN: 1
-driver_SEIMIN: 1
+cs_pin: PA15                     # ADAPT: SPI chip-select pin on your board
+spi_bus: spi4                    # ADAPT: SPI bus name on your board
+spi_speed: 2000000               # ADAPT only if your board needs it
+rref: 12300                      # ADAPT: external reference resistor on your TMC2240 module (Ω)
+run_current: 0.85                # ADAPT: motor RMS current — match your stepper datasheet
+hold_current: 0.6                # ADAPT: typically 60–70% of run_current
+interpolate: false               # required for clean SG readings (true also works but adds noise)
+stealthchop_threshold: 999999    # required: StallGuard needs StealthChop active at all speeds
+coolstep_threshold: 0.5          # required: enables StallGuard reading above this velocity
+driver_SEMIN: 5                  # required for CoolStep mode (must be > 0)
+driver_SEMAX: 2                  # CoolStep upper threshold
+driver_SEUP: 2                   # current increment step
+driver_SEDN: 1                   # current decrement step
+driver_SEIMIN: 1                 # min current = 1/2 IRUN when CoolStep regulates down
 ```
 
 #### TMC2240, CoolStep disabled
 
 ```ini
 [tmc2240 extruder]
-cs_pin: PA15
-spi_bus: spi4
-spi_speed: 2000000
-rref: 12300
-run_current: 0.85
-hold_current: 0.6
-interpolate: false
-stealthchop_threshold: 999999
-coolstep_threshold: 0.5
-driver_SEMIN: 0
+cs_pin: PA15                     # ADAPT: SPI chip-select pin on your board
+spi_bus: spi4                    # ADAPT: SPI bus name on your board
+spi_speed: 2000000               # ADAPT only if your board needs it
+rref: 12300                      # ADAPT: external reference resistor on your TMC2240 module (Ω)
+run_current: 0.85                # ADAPT: motor RMS current
+hold_current: 0.6                # ADAPT: typically 60–70% of run_current
+interpolate: false               # required for clean SG readings
+stealthchop_threshold: 999999    # required: StallGuard needs StealthChop
+coolstep_threshold: 0.5          # required: enables StallGuard reading
+driver_SEMIN: 0                  # required for SG-only mode (CoolStep disabled)
 ```
 
 #### TMC2209, CoolStep enabled
 
 ```ini
 [tmc2209 extruder]
-uart_pin: PB12
-run_current: 0.85
-hold_current: 0.6
-interpolate: false
-stealthchop_threshold: 999999
-coolstep_threshold: 0.5
-driver_SEMIN: 5
+uart_pin: PB12                   # ADAPT: UART pin on your board (CAN toolheads need 'can0:' prefix)
+#tx_pin: PB11                    # ADAPT: only needed on some boards (separate TX/RX)
+#uart_address: 3                 # ADAPT: only when multiple TMC2209s share one UART
+run_current: 0.85                # ADAPT: motor RMS current
+hold_current: 0.6                # ADAPT: typically 60–70% of run_current
+sense_resistor: 0.110            # ADAPT: matches your stepstick (typical 0.110 Ω, some boards 0.075 Ω)
+interpolate: false               # required for clean SG readings
+stealthchop_threshold: 999999    # required: StallGuard needs StealthChop
+coolstep_threshold: 0.5          # required: enables StallGuard reading
+driver_SEMIN: 5                  # required for CoolStep mode (must be > 0)
 driver_SEMAX: 2
 driver_SEUP: 2
 driver_SEDN: 1
@@ -164,18 +169,28 @@ driver_SEIMIN: 1
 
 ```ini
 [tmc2209 extruder]
-uart_pin: PB12
-run_current: 0.85
-hold_current: 0.6
-interpolate: false
-stealthchop_threshold: 999999
-coolstep_threshold: 0.5
-driver_SEMIN: 0
+uart_pin: PB12                   # ADAPT: UART pin on your board
+#tx_pin: PB11                    # ADAPT: only on some boards
+#uart_address: 3                 # ADAPT: only when sharing UART
+run_current: 0.85                # ADAPT: motor RMS current
+hold_current: 0.6                # ADAPT
+sense_resistor: 0.110            # ADAPT: matches your stepstick
+interpolate: false               # required
+stealthchop_threshold: 999999    # required
+coolstep_threshold: 0.5          # required
+driver_SEMIN: 0                  # required for SG-only mode
 ```
+
+#### Pin reference: where to find your values
+
+If you're not sure what pins to use:
+- **Existing config**: if you already have a `[tmc2240 extruder]` or `[tmc2209 extruder]` block in your `printer.cfg`, **keep your existing pins/wiring** and just add/update the StallGuard-related lines (`stealthchop_threshold`, `coolstep_threshold`, `driver_SEMIN`, ...).
+- **Board manual**: check your control board's documentation (BTT, Mellow, MKS, etc.) for the correct `cs_pin`/`uart_pin`/`spi_bus` values.
+- **CAN toolheads**: pins prefix with `can0:` — for example `uart_pin: can0:PA15`.
 
 ### 2. StallGuard threshold setup
 
-Some StallGuard parameters can't be set directly in the `[tmcXXXX]` section — they need a `delayed_gcode`:
+Some StallGuard parameters can't be set directly in the `[tmcXXXX]` section — they need a `delayed_gcode` that runs after Klipper boot:
 
 #### For TMC2240
 
@@ -187,6 +202,8 @@ gcode:
     SET_TMC_FIELD STEPPER=extruder FIELD=sg4_filt_en VALUE=1
 ```
 
+> The `VALUE=80` for `sg4_thrs` is a starting point for typical pancake-style steppers. Higher = more sensitive. Range 0–255. If the test triggers immediately at low flow, lower this value (e.g. 60). If it never triggers, raise it.
+
 #### For TMC2209
 
 ```ini
@@ -196,20 +213,24 @@ gcode:
     SET_TMC_FIELD STEPPER=extruder FIELD=sgthrs VALUE=100
 ```
 
-(TMC2209 has no filter field.)
+> The `VALUE=100` for `sgthrs` is a starting point. Higher = more sensitive. Range 0–255. TMC2209 has no filter field (unlike TMC2240).
 
 ### 3. Plugin configuration
 
 ```ini
 [tmc_flow_test]
-extruder_stepper: extruder
-filament_diameter: 1.75
-melt_zone_length: 42
+extruder_stepper: extruder       # ADAPT: name of your extruder stepper section
+filament_diameter: 1.75          # ADAPT: 1.75 or 2.85 / 3.0 for direct-drive types
+melt_zone_length: 42             # ADAPT: hotend melt-zone length in mm (Sherpa Mini ~42, V6 ~12, Volcano ~21)
 
 # Optional:
-#min_hotend_temp: 180
+#min_hotend_temp: 180            # safety floor — test refuses to run below this
 #output_dir: ~/printer_data/config/Flowtest
 ```
+
+A complete sample config is in [`sample_config.cfg`](sample_config.cfg).
+
+---
 
 ## Commands
 
@@ -318,6 +339,15 @@ Configure your driver the way you always print, then run `TMC_FLOW_FIND_MAX`. Th
 
 ## Troubleshooting
 
+### "Unable to read tmc uart 'extruder' register IFCNT"
+
+UART communication with the TMC2209 isn't working. Not a plugin issue — Klipper can't talk to the driver at all.
+
+- Check `uart_pin` (CAN toolheads need `can0:` prefix, e.g., `uart_pin: can0:PA15`)
+- Check `uart_address` if multiple drivers share a UART
+- Check sense resistor value (`sense_resistor: 0.110` for typical SilentStepSticks)
+- If using `klipper_tmc_autotune`, try commenting out `[autotune_tmc extruder]` temporarily — known conflict on some setups
+
 ### "sg4_thrs is 0. StallGuard trigger inactive."
 
 The `delayed_gcode setup_extruder_sg` block is missing or didn't run. Check that it's in your `printer.cfg` and run `FIRMWARE_RESTART`.
@@ -380,3 +410,9 @@ YouTube: [@crydteamprinting](https://www.youtube.com/@crydteamprinting)
 Released under the GNU General Public License v3.0. See [LICENSE](LICENSE) for details.
 
 Inspired by Klipper's StallGuard implementation and the work of the [klipper_tmc_autotune](https://github.com/andrewmcgr/klipper_tmc_autotune) project.
+
+---
+
+## Contributing
+
+Issues and pull requests welcome. If you've tested this on a driver not listed above (TMC5160, TMC2130, TMC2226, TMC2660), let me know how it went — I'd love to add confirmed-working markers for those.
