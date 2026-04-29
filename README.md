@@ -2,7 +2,7 @@
 
 **Adaptive max-volumetric-flow detection for 3D printer extruders using TMC StallGuard.**
 
-Find your extruder's real maximum flow rate automatically — no test prints, no measuring melted noodles, no eyeballing under-extrusion.
+Find your extruder's real maximum flow rate automatically — no test prints, no measuring melted noodles. 
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Klipper](https://img.shields.io/badge/Klipper-compatible-green.svg)](https://www.klipper3d.org/)
