@@ -48,7 +48,7 @@ Slicer recommendation:
 | TMC5160 | SG2        | fallback |
 | TMC2130 / TMC2208 / TMC2226 / TMC2660 | SG2 | fallback |
 
-- StealthChop must be the active chopper mode (sensorless homing requirement)
+- **StealthChop must be the active chopper mode** for the test — see [the StealthChop section](#-important-stealthchop-required-for-stallguard) below
 - Hotend at print temperature
 
 ---
@@ -232,6 +232,79 @@ A complete sample config is in [`sample_config.cfg`](sample_config.cfg).
 
 ---
 
+## ⚠️ Important: StealthChop required for StallGuard
+
+This plugin can only work when the extruder driver is in **StealthChop** mode. This is a hardware limitation of the TMC chips, not the plugin:
+
+- **TMC2240 / TMC2209**: use **StallGuard4**, which works only in StealthChop ([source: Trinamic AN-002](https://www.analog.com/en/resources/app-notes/an-002.html))
+- **TMC5160 / TMC2130 / TMC2660**: use StallGuard2, which works only in SpreadCycle
+
+Klipper's default for all TMC drivers is **SpreadCycle**. Many printer profiles (Voron, RatRig, etc.) use SpreadCycle on the extruder for higher torque. **In that default state, the plugin won't work** — it will report `SG median = n/a` or fail the config check with `stealthchop_threshold` warnings.
+
+### How do I know which mode I'm in?
+
+Run in the Klipper console:
+
+```
+DUMP_TMC STEPPER=extruder
+```
+
+Look at the output:
+
+- For **TMC2240**: line `en_pwm_mode=1` means StealthChop, `en_pwm_mode=0` means SpreadCycle
+- For **TMC2209**: line `en_spreadCycle=0` means StealthChop, `en_spreadCycle=1` means SpreadCycle
+- All drivers: if `tpwmthrs` is mid-range (not 0 and not 0xFFFFF), the driver switches modes based on speed — that's a problem for the test
+
+You can also just run `TMC_FLOW_STATUS` — the plugin checks all of this and reports any issues.
+
+### What if my extruder is on SpreadCycle?
+
+You have three options:
+
+#### Option 1 — Switch your extruder to StealthChop permanently (recommended)
+
+Add to your `[tmc2240 extruder]` or `[tmc2209 extruder]` section in `printer.cfg`:
+
+```ini
+stealthchop_threshold: 999999
+```
+
+Then `FIRMWARE_RESTART`. The `999999` value means "always use StealthChop, regardless of speed".
+
+**Trade-offs to be aware of:**
+- StealthChop is quieter and runs cooler at low/medium speeds
+- SpreadCycle gives higher peak torque at very high speeds and accelerations
+- Some users see [slight pressure-advance differences](https://www.klipper3d.org/TMC_Drivers.html#stallguard-and-stealthchop) when switching modes
+
+For most extruders below ~50 mm³/s, StealthChop works fine and is what `klipper_tmc_autotune` recommends by default. Try it on a calibration print before your next big print.
+
+#### Option 2 — Switch only for the test, then back
+
+If you really want to keep SpreadCycle for printing but still run this test:
+
+```
+# Before the test:
+SET_TMC_FIELD STEPPER=extruder FIELD=en_pwm_mode VALUE=1   # TMC2240
+# or for TMC2209:
+SET_TMC_FIELD STEPPER=extruder FIELD=en_spreadCycle VALUE=0
+
+# Run the test:
+TMC_FLOW_FIND_MAX
+
+# After the test, revert:
+SET_TMC_FIELD STEPPER=extruder FIELD=en_pwm_mode VALUE=0   # TMC2240
+# or for TMC2209:
+SET_TMC_FIELD STEPPER=extruder FIELD=en_spreadCycle VALUE=1
+```
+
+**⚠️ Caveat:** The result will reflect the StealthChop max flow, not your normal SpreadCycle behaviour. Expect the actual SpreadCycle limit to be **5–15% higher** than what the test reports, because SpreadCycle delivers more torque at high speeds. Use the test value as a conservative lower bound.
+
+#### Option 3 — Don't use this plugin
+
+If your extruder absolutely needs SpreadCycle (very high-flow setups, specific motor characteristics), this plugin isn't the right tool. Stick to traditional flow tower prints — they don't depend on chopper mode.
+
+---
+
 ## Commands
 
 ### `TMC_FLOW_FIND_MAX`
@@ -339,6 +412,12 @@ Configure your driver the way you always print, then run `TMC_FLOW_FIND_MAX`. Th
 
 ## Troubleshooting
 
+### "StealthChop is not active. StallGuard needs StealthChop ON."
+
+Your `[tmcXXXX extruder]` section is missing `stealthchop_threshold: 999999` (or it's set to a low value that disables StealthChop at higher speeds). See [the StealthChop section](#-important-stealthchop-required-for-stallguard) for the full explanation and three options to fix it.
+
+Quickest fix: add `stealthchop_threshold: 999999` to your extruder TMC section and `FIRMWARE_RESTART`.
+
 ### "Unable to read tmc uart 'extruder' register IFCNT"
 
 UART communication with the TMC2209 isn't working. Not a plugin issue — Klipper can't talk to the driver at all.
@@ -363,7 +442,11 @@ SET_TMC_FIELD STEPPER=extruder FIELD=sg4_filt_en VALUE=1
 
 ### "SG median = n/a" during the test
 
-SG values aren't being read. Make sure you're running the latest plugin version which reads SG/CS directly from the driver registers (not via `get_status()`).
+The most common cause: your extruder is in **SpreadCycle** mode, not StealthChop. StallGuard4 (TMC2240/TMC2209) only works in StealthChop. See [the StealthChop section above](#-important-stealthchop-required-for-stallguard) for how to fix this.
+
+Other possible causes:
+- Plugin is older than the register-direct-read version — make sure you're on the latest from this repo (the plugin must read SG/CS directly from the driver registers, not via `get_status()`)
+- TMC driver isn't responding at all — run `DUMP_TMC STEPPER=extruder` to verify communication
 
 ### Reached MAX without trigger
 
