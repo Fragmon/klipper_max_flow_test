@@ -57,7 +57,7 @@ Slicer recommendation:
 
 ```bash
 cd ~
-git clone https://github.com/<YOUR_USERNAME>/tmc_flow_test.git
+git clone https://github.com/Fragmon/klipper_max_flow_test.git
 ln -s ~/tmc_flow_test/tmc_flow_test.py ~/klipper/klippy/extras/tmc_flow_test.py
 ```
 
@@ -210,10 +210,6 @@ melt_zone_length: 42
 #min_hotend_temp: 180
 #output_dir: ~/printer_data/config/Flowtest
 ```
-
-A complete sample config is in [`sample_config.cfg`](sample_config.cfg).
-
----
 
 ## Commands
 
