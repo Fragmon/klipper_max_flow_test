@@ -322,15 +322,6 @@ Configure your driver the way you always print, then run `TMC_FLOW_FIND_MAX`. Th
 
 ## Troubleshooting
 
-### "Unable to read tmc uart 'extruder' register IFCNT"
-
-UART communication with the TMC2209 isn't working. Not a plugin issue — Klipper can't talk to the driver at all.
-
-- Check `uart_pin` (CAN toolheads need `can0:` prefix, e.g., `uart_pin: can0:PA15`)
-- Check `uart_address` if multiple drivers share a UART
-- Check sense resistor value (`sense_resistor: 0.110` for typical SilentStepSticks)
-- If using `klipper_tmc_autotune`, try commenting out `[autotune_tmc extruder]` temporarily — known conflict on some setups
-
 ### "sg4_thrs is 0. StallGuard trigger inactive."
 
 The `delayed_gcode setup_extruder_sg` block is missing or didn't run. Check that it's in your `printer.cfg` and run `FIRMWARE_RESTART`.
@@ -393,9 +384,3 @@ YouTube: [@crydteamprinting](https://www.youtube.com/@crydteamprinting)
 Released under the GNU General Public License v3.0. See [LICENSE](LICENSE) for details.
 
 Inspired by Klipper's StallGuard implementation and the work of the [klipper_tmc_autotune](https://github.com/andrewmcgr/klipper_tmc_autotune) project.
-
----
-
-## Contributing
-
-Issues and pull requests welcome. If you've tested this on a driver not listed above (TMC5160, TMC2130, TMC2226, TMC2660), let me know how it went — I'd love to add confirmed-working markers for those.
