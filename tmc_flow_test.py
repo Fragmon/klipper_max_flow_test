@@ -1377,16 +1377,25 @@ new Chart(document.getElementById('sgChart'), {
                     % (sg_label, last_iqr, avg_prior_iqr,
                        last_iqr / avg_prior_iqr))
 
-        # (b) ratio vs coarse baseline (bisection only)
+        # (b) ratio vs coarse baseline (bisection only).
+        # Cross-check with CV: a pure spread anomaly with NORMAL CV is
+        # often just statistical fluctuation (e.g. a single outlying
+        # sample stretched the IQR but the run-to-run averages are
+        # tight). Genuine slip widens BOTH spread AND CV. So we only
+        # fire when CV also confirms elevated noise relative to coarse.
         if in_bisection:
             coarse_iqrs = []
+            coarse_cvs = []
             for r in results[:-1]:
                 if r.get('phase', 'coarse') != 'coarse':
                     continue
                 sg_p = r.get('sg') or {}
                 if 'p25' in sg_p and 'p75' in sg_p:
                     coarse_iqrs.append(sg_p['p75'] - sg_p['p25'])
-            if len(coarse_iqrs) >= 4:
+                rc = r.get('run_consistency') or {}
+                if 'sg_cv' in rc:
+                    coarse_cvs.append(rc['sg_cv'])
+            if len(coarse_iqrs) >= 4 and len(coarse_cvs) >= 4:
                 # Median of all but the last coarse step (which may be
                 # the elevated step that triggered bisection).
                 sorted_iqr = sorted(coarse_iqrs[:-1])
@@ -1394,18 +1403,30 @@ new Chart(document.getElementById('sgChart'), {
                 median_coarse_iqr = (sorted_iqr[n // 2] if n % 2
                                      else (sorted_iqr[n // 2 - 1]
                                            + sorted_iqr[n // 2]) / 2)
-                # Require both ratio AND absolute delta — small
-                # baselines (e.g. 6 raw units) shouldn't trigger on a
-                # 14-unit IQR at the natural bisection noise floor.
+                sorted_cv = sorted(coarse_cvs[:-1])
+                m = len(sorted_cv)
+                median_coarse_cv = (sorted_cv[m // 2] if m % 2
+                                    else (sorted_cv[m // 2 - 1]
+                                          + sorted_cv[m // 2]) / 2)
+                last_rc = last.get('run_consistency') or {}
+                last_cv = last_rc.get('sg_cv', 0.0)
+                # CV cross-check: must be elevated vs coarse AND >=3%
+                # absolute. If CV is below baseline-ish, it's not slip
+                # — it's a wide-distribution fluke.
+                cv_confirms = (last_cv >= 3.0
+                               and median_coarse_cv >= 0.5
+                               and last_cv >= 1.5 * median_coarse_cv)
                 if (median_coarse_iqr >= 1
                         and last_iqr >= 18
-                        and last_iqr >= 2.5 * median_coarse_iqr):
+                        and last_iqr >= 2.5 * median_coarse_iqr
+                        and cv_confirms):
                     return ("%s spread IQR %.0f in %s vs coarse-phase "
-                            "median IQR ~%.0f (%.1fx) — slip widening "
-                            "above clean-extrusion noise"
+                            "median IQR ~%.0f (%.1fx); CV %.1f%% also "
+                            "elevated vs coarse %.1f%% — slip widening"
                             % (sg_label, last_iqr, last_phase,
                                median_coarse_iqr,
-                               last_iqr / median_coarse_iqr))
+                               last_iqr / median_coarse_iqr,
+                               last_cv, median_coarse_cv))
 
         return None
 
@@ -1475,10 +1496,17 @@ new Chart(document.getElementById('sgChart'), {
                          and (coarse_med_cv < 1
                               or last_cv >= 1.5 * coarse_med_cv))
 
-        # IQR gray zone: wide but not extreme
+        # IQR gray zone: wide but not extreme. Cross-check with CV — a
+        # widened IQR with a very LOW CV is usually just one outlier
+        # sample stretching the percentiles, not real intermittent
+        # slip. Genuine slip widens both spread and run-to-run noise.
+        # We require CV at least 2% absolute (more than typical clean
+        # noise) for IQR-only borderlines to count.
         iqr_borderline = (15 <= last_iqr < 25
                           and (coarse_med_iqr < 1
-                               or last_iqr >= 1.7 * coarse_med_iqr))
+                               or last_iqr >= 1.7 * coarse_med_iqr)
+                          and last_cv is not None
+                          and last_cv >= 2.0)
 
         if cv_borderline and iqr_borderline:
             return ("CV %.1f%% (vs coarse ~%.1f%%) AND IQR %.0f "
@@ -2122,102 +2150,243 @@ new Chart(document.getElementById('sgChart'), {
                               no_html, mode, gcmd=gcmd)
             return
 
-        # ─── PHASE 2: Bisection ───
-        if cooldown > 0:
-            gcmd.respond_info(
-                "  ... Cool-down: %.0f s ..." % cooldown)
-            self.gcode.run_script_from_command(
-                "G4 P%d" % int(cooldown * 1000))
+        # ─── PHASES 2 + 3: Bisection + Verify (with retry) ───
+        # Phase 2 narrows the bracket; Phase 3 confirms the result. If
+        # Phase 3 fails (verify itself trips a trigger or stays
+        # borderline on re-test), we drop back into Phase 2 with a
+        # tightened high bound and try again. Up to MAX_VERIFY_FAILURES
+        # rounds before giving up — without this cap a hardware /
+        # filament issue could loop forever.
+        MAX_VERIFY_FAILURES = 3
 
-        gcmd.respond_info(
-            "\n>>> Phase 2: Bisection <<<\n"
-            "  Narrowing [%.0f, %.0f] by halving until interval ≤ %.0f. "
-            "Up to %d steps.\n"
-            "  Borderline measurements (CV 4-7%% or IQR 15-24) are "
-            "re-tested once for confirmation."
-            % (low, high, min_step, max_bisect))
-
-        bisect_iter = 0
+        # Track which flows we've already re-tested in bisection (set
+        # is reset on each bisection re-entry to allow fresh re-tests
+        # at the new bracket).
         last_trigger_reason = first_trigger_reason
-        # Track which flows we've already re-tested to avoid infinite
-        # loops on persistently-borderline values.
-        retested_flows = set()
-        while (high - low) > min_step + 0.001 and bisect_iter < max_bisect:
-            bisect_iter += 1
-            raw_mid = (low + high) / 2.0
-            mid = round(raw_mid / min_step) * min_step
-            if mid <= low + 0.001 or mid >= high - 0.001:
-                break
+        verify_failures = 0
+        verify_result = None
+        verify_cv = 0.0
 
-            r = measure_and_save(mid, 'bisect')
-            reason = check(results)
+        while True:
+            # ─── PHASE 2: Bisection ───
+            if cooldown > 0:
+                gcmd.respond_info(
+                    "  ... Cool-down: %.0f s ..." % cooldown)
+                self.gcode.run_script_from_command(
+                    "G4 P%d" % int(cooldown * 1000))
 
-            # Borderline check: if no clear trigger fired but the data
-            # sits in the gray zone, re-measure once before classifying.
-            # Re-test ONLY if (a) no trigger fired (otherwise we already
-            # have a decision) and (b) we haven't already re-tested
-            # this same flow.
-            if (reason is None
-                    and mid not in retested_flows):
-                borderline_why = self._is_borderline(results)
-                if borderline_why:
-                    retested_flows.add(mid)
+            phase2_label = (("\n>>> Phase 2: Bisection (retry %d) <<<"
+                             % verify_failures)
+                            if verify_failures > 0
+                            else "\n>>> Phase 2: Bisection <<<")
+            gcmd.respond_info(
+                "%s\n"
+                "  Narrowing [%.0f, %.0f] by halving until interval ≤ %.0f. "
+                "Up to %d steps.\n"
+                "  Borderline measurements (CV 4-7%% or IQR 15-24) are "
+                "re-tested once for confirmation."
+                % (phase2_label, low, high, min_step, max_bisect))
+
+            bisect_iter = 0
+            retested_flows = set()
+            while ((high - low) > min_step + 0.001
+                   and bisect_iter < max_bisect):
+                bisect_iter += 1
+                raw_mid = (low + high) / 2.0
+                mid = round(raw_mid / min_step) * min_step
+                if mid <= low + 0.001 or mid >= high - 0.001:
+                    break
+
+                r = measure_and_save(mid, 'bisect')
+                reason = check(results)
+
+                # Borderline check: if no clear trigger fired but the
+                # data sits in the gray zone, re-measure once before
+                # classifying.
+                if (reason is None
+                        and mid not in retested_flows):
+                    borderline_why = self._is_borderline(results)
+                    if borderline_why:
+                        retested_flows.add(mid)
+                        gcmd.respond_info(
+                            "  >>> %.1f mm³/s BORDERLINE — %s\n"
+                            "      Re-measuring once for confirmation..."
+                            % (mid, borderline_why))
+                        if cooldown > 0:
+                            self.gcode.run_script_from_command(
+                                "G4 P%d" % int(cooldown * 1000))
+                        # Drop the borderline measurement and replace
+                        # with the fresh one.
+                        results.pop()
+                        r2 = measure_and_save(mid, 'bisect')
+                        reason = check(results)
+                        if reason is None:
+                            re_borderline = self._is_borderline(results)
+                            if re_borderline:
+                                reason = ("borderline confirmed on re-"
+                                          "test: " + re_borderline)
+
+                if reason:
+                    high = mid
+                    last_trigger_reason = reason
                     gcmd.respond_info(
-                        "  >>> %.1f mm³/s BORDERLINE — %s\n"
+                        "  >>> TRIGGER at %.1f — %s\n"
+                        "      → [%.1f, %.1f] (%d/%d)"
+                        % (mid, reason, low, high,
+                           bisect_iter, max_bisect))
+                else:
+                    low = mid
+                    gcmd.respond_info(
+                        "  >>> %.1f mm³/s SAFE → [%.1f, %.1f] (%d/%d)"
+                        % (mid, low, high, bisect_iter, max_bisect))
+                self.gcode.run_script_from_command("G4 P500")
+
+            # ─── PHASE 3: Verify ───
+            if cooldown > 0:
+                gcmd.respond_info(
+                    "  ... Cool-down before verification: %.0f s ..."
+                    % cooldown)
+                self.gcode.run_script_from_command(
+                    "G4 P%d" % int(cooldown * 1000))
+
+            gcmd.respond_info(
+                "\n>>> Phase 3: Verification at %.1f mm³/s <<<\n"
+                "  Confirming with %d repetitions."
+                % (low, verify_repeats))
+            verify_result = self._measure_step(
+                gcmd, low, step_duration, verify_repeats,
+                sample_cs=sample_cs)
+            verify_result['phase'] = 'verify'
+            results.append(verify_result)
+
+            # Check verify result against triggers and borderline.
+            verify_trigger = check(results)
+            if verify_trigger is None:
+                verify_borderline = self._is_borderline(results)
+                if verify_borderline:
+                    # Re-measure verify once at the same flow before
+                    # accepting; if it stays borderline, treat as fail.
+                    gcmd.respond_info(
+                        "  >>> Verify at %.1f BORDERLINE — %s\n"
                         "      Re-measuring once for confirmation..."
-                        % (mid, borderline_why))
+                        % (low, verify_borderline))
                     if cooldown > 0:
                         self.gcode.run_script_from_command(
                             "G4 P%d" % int(cooldown * 1000))
-                    # Drop the borderline measurement from the results
-                    # list and replace with the fresh one. This keeps
-                    # the trend baselines clean (one entry per flow).
                     results.pop()
-                    r2 = measure_and_save(mid, 'bisect')
-                    reason = check(results)
-                    # If second pass is clearly safer, classify as safe.
-                    # If second pass also borderline (or worse) AND any
-                    # of CV/IQR is at upper end of gray zone, treat as
-                    # trigger to err on the safe side.
-                    if reason is None:
+                    verify_result = self._measure_step(
+                        gcmd, low, step_duration, verify_repeats,
+                        sample_cs=sample_cs)
+                    verify_result['phase'] = 'verify'
+                    results.append(verify_result)
+                    verify_trigger = check(results)
+                    if verify_trigger is None:
                         re_borderline = self._is_borderline(results)
                         if re_borderline:
-                            # Two consecutive borderline measurements at
-                            # the same flow → confirm it's not noise,
-                            # treat as trigger.
-                            reason = ("borderline confirmed on re-test: "
-                                      + re_borderline)
+                            verify_trigger = ("borderline confirmed on "
+                                              "re-test: "
+                                              + re_borderline)
 
-            if reason:
-                high = mid
-                last_trigger_reason = reason
-                gcmd.respond_info(
-                    "  >>> TRIGGER at %.1f — %s\n"
-                    "      → [%.1f, %.1f] (%d/%d)"
-                    % (mid, reason, low, high, bisect_iter, max_bisect))
-            else:
-                low = mid
-                gcmd.respond_info(
-                    "  >>> %.1f mm³/s SAFE → [%.1f, %.1f] (%d/%d)"
-                    % (mid, low, high, bisect_iter, max_bisect))
-            self.gcode.run_script_from_command("G4 P500")
+            if verify_trigger is None:
+                # Verify clean — accept the result.
+                break
 
-        # ─── PHASE 3: Verify ───
-        if cooldown > 0:
+            # Verify FAILED. Drop back into bisection with a tighter
+            # high bound (the just-failed flow becomes the new high).
+            verify_failures += 1
+            verify_cv_now = (verify_result.get('run_consistency', {})
+                             .get('sg_cv', 0.0))
             gcmd.respond_info(
-                "  ... Cool-down before verification: %.0f s ..." % cooldown)
-            self.gcode.run_script_from_command(
-                "G4 P%d" % int(cooldown * 1000))
+                "\n  >>> ⚠ VERIFY FAILED at %.1f mm³/s "
+                "(CV %.1f%%, attempt %d/%d)\n"
+                "      Reason: %s"
+                % (low, verify_cv_now, verify_failures,
+                   MAX_VERIFY_FAILURES, verify_trigger))
 
-        gcmd.respond_info(
-            "\n>>> Phase 3: Verification at %.1f mm³/s <<<\n"
-            "  Confirming with %d repetitions."
-            % (low, verify_repeats))
-        verify_result = self._measure_step(
-            gcmd, low, step_duration, verify_repeats,
-            sample_cs=sample_cs)
-        verify_result['phase'] = 'verify'
-        results.append(verify_result)
+            if verify_failures >= MAX_VERIFY_FAILURES:
+                # Give up gracefully — report the next-lower safe step
+                # we have evidence for. Search results history for the
+                # last bisect/coarse step at flow < low that did NOT
+                # trigger.
+                fallback = None
+                for r in reversed(results[:-1]):  # skip the failed verify
+                    if r.get('phase') in ('coarse', 'bisect'):
+                        if r['flow'] < low - 0.001:
+                            fallback = r['flow']
+                            break
+                if fallback is None:
+                    fallback = max(start_flow, low - min_step)
+                gcmd.respond_info(
+                    "  Maximum verify retries reached — falling back "
+                    "to last known-good flow %.1f mm³/s." % fallback)
+                low = fallback
+                last_trigger_reason = verify_trigger
+                # Do one final verify at the fallback to populate the
+                # final verify_result with this lower value.
+                if cooldown > 0:
+                    self.gcode.run_script_from_command(
+                        "G4 P%d" % int(cooldown * 1000))
+                gcmd.respond_info(
+                    "\n>>> Phase 3: Final verification at %.1f mm³/s "
+                    "<<<\n  Confirming with %d repetitions."
+                    % (low, verify_repeats))
+                verify_result = self._measure_step(
+                    gcmd, low, step_duration, verify_repeats,
+                    sample_cs=sample_cs)
+                verify_result['phase'] = 'verify'
+                results.append(verify_result)
+                break
+
+            # Tighten bracket: failed flow becomes new high.
+            high = low
+            # Drop low to the previous safe step we have data for, or
+            # one min_step below if no earlier safe step exists.
+            new_low = None
+            for r in reversed(results[:-1]):  # skip failed verify
+                if r.get('phase') in ('coarse', 'bisect'):
+                    if r['flow'] < high - 0.001:
+                        # Was this flow a safe one?  Check it didn't
+                        # carry a trigger.
+                        # (Heuristic: if the flow appears as a
+                        # 'safe' entry — i.e. CV < 4% AND not
+                        # borderline by current standards — accept
+                        # it as the new low.)
+                        rc = r.get('run_consistency') or {}
+                        cv = rc.get('sg_cv', 99.0)
+                        sgp = r.get('sg') or {}
+                        iqr = (sgp.get('p75', 0) - sgp.get('p25', 0)
+                               if 'p25' in sgp and 'p75' in sgp else 99)
+                        if cv < 4.0 and iqr < 15:
+                            new_low = r['flow']
+                            break
+            if new_low is None:
+                new_low = max(start_flow, high - 2 * min_step)
+            low = new_low
+            last_trigger_reason = verify_trigger
+            gcmd.respond_info(
+                "      → Re-entering bisection with bracket "
+                "[%.1f, %.1f]" % (low, high))
+
+            # Sanity: bracket too tight to bisect → just accept low.
+            if (high - low) <= min_step + 0.001:
+                gcmd.respond_info(
+                    "      Bracket already tight, "
+                    "accepting %.1f as final." % low)
+                # Do one more verify at this low to capture the final
+                # measurement metadata.
+                if cooldown > 0:
+                    self.gcode.run_script_from_command(
+                        "G4 P%d" % int(cooldown * 1000))
+                gcmd.respond_info(
+                    "\n>>> Phase 3: Final verification at %.1f mm³/s "
+                    "<<<\n  Confirming with %d repetitions."
+                    % (low, verify_repeats))
+                verify_result = self._measure_step(
+                    gcmd, low, step_duration, verify_repeats,
+                    sample_cs=sample_cs)
+                verify_result['phase'] = 'verify'
+                results.append(verify_result)
+                break
 
         verify_cv = (verify_result.get('run_consistency', {}).get('sg_cv', 0)
                      if verify_result.get('run_consistency') else 0)
