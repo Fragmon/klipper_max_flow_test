@@ -148,6 +148,8 @@ hold_current: 0.6                # ADAPT: typically 60–70% of run_current
 interpolate: false               # required for clean SG readings (true also works but adds noise)
 stealthchop_threshold: 999999    # required: StallGuard needs StealthChop active at all speeds
 coolstep_threshold: 0.5          # required: enables StallGuard reading above this velocity
+driver_sg4_thrs: 80              # SG4 sensitivity (0-255, higher = more sensitive). Tune per setup.
+driver_sg4_filt_en: True         # SG4 filter enabled (recommended for extruders)
 driver_SEMIN: 5                  # required for CoolStep mode (must be > 0)
 driver_SEMAX: 2                  # CoolStep upper threshold
 driver_SEUP: 2                   # current increment step
@@ -168,6 +170,8 @@ hold_current: 0.6                # ADAPT: typically 60–70% of run_current
 interpolate: false               # required for clean SG readings
 stealthchop_threshold: 999999    # required: StallGuard needs StealthChop
 coolstep_threshold: 0.5          # required: enables StallGuard reading
+driver_sg4_thrs: 80              # SG4 sensitivity, tune per setup
+driver_sg4_filt_en: True         # SG4 filter
 driver_SEMIN: 0                  # required for SG-only mode (CoolStep disabled)
 ```
 
@@ -184,6 +188,7 @@ sense_resistor: 0.110            # ADAPT: matches your stepstick (typical 0.110 
 interpolate: false               # required for clean SG readings
 stealthchop_threshold: 999999    # required: StallGuard needs StealthChop
 coolstep_threshold: 0.5          # required: enables StallGuard reading
+driver_SGTHRS: 100               # SG4 sensitivity (0-255, higher = more sensitive). Tune per setup.
 driver_SEMIN: 5                  # required for CoolStep mode (must be > 0)
 driver_SEMAX: 2
 driver_SEUP: 2
@@ -204,6 +209,7 @@ sense_resistor: 0.110            # ADAPT: matches your stepstick
 interpolate: false               # required
 stealthchop_threshold: 999999    # required
 coolstep_threshold: 0.5          # required
+driver_SGTHRS: 100               # SG4 sensitivity, tune per setup
 driver_SEMIN: 0                  # required for SG-only mode
 ```
 
@@ -225,6 +231,9 @@ interpolate: false               # required for clean SG readings
 # enables StealthChop with a velocity threshold of 0, which breaks
 # StallGuard2.
 coolstep_threshold: 0.5          # required: enables StallGuard reading above this velocity
+driver_SGT: 15                   # SG2 sensitivity, signed -64..63. HIGHER = LESS sensitive
+                                 # (raises SG_RESULT). Tune per setup; see "StallGuard tuning" below.
+driver_SFILT: True               # SG2 filter — averages over 4 full-steps. Recommended for extruders.
 # CoolStep tunables — values below are SG2-tuned (see note after next block).
 # For SG4 drivers (TMC2240/2209) use SEMIN: 5, SEMAX: 2 instead.
 driver_SEMIN: 2                  # SG2 typical: SG_MAX/4..SG_MAX/8 (here ≈ SG_MAX/30)
@@ -248,6 +257,8 @@ interpolate: false               # required
 # IMPORTANT: do NOT add `stealthchop_threshold:` — see TMC5160 CoolStep
 # enabled section above for why. Klipper's default is SpreadCycle-only.
 coolstep_threshold: 0.5          # required
+driver_SGT: 15                   # SG2 sensitivity, signed -64..63 (higher = less sensitive)
+driver_SFILT: True               # SG2 filter
 driver_SEMIN: 0                  # required for SG-only mode (CoolStep disabled)
 ```
 
@@ -262,54 +273,47 @@ Per Trinamic AN-002 the rule of thumb is `SEMIN ≈ SG_MAX / 4 .. SG_MAX / 8`. F
 #### Pin reference: where to find your values
 
 If you're not sure what pins to use:
-- **Existing config**: if you already have a `[tmc2240 extruder]` or `[tmc2209 extruder]` block in your `printer.cfg`, **keep your existing pins/wiring** and just add/update the StallGuard-related lines (`stealthchop_threshold`, `coolstep_threshold`, `driver_SEMIN`, ...).
+- **Existing config**: if you already have a `[tmc2240 extruder]` or `[tmc2209 extruder]` block in your `printer.cfg`, **keep your existing pins/wiring** and just add/update the StallGuard-related lines (`stealthchop_threshold`, `coolstep_threshold`, `driver_SGT` / `driver_sg4_thrs`, `driver_SFILT` / `driver_sg4_filt_en`, `driver_SEMIN`, ...).
 - **Board manual**: check your control board's documentation (BTT, Mellow, MKS, etc.) for the correct `cs_pin`/`uart_pin`/`spi_bus` values.
 - **CAN toolheads**: pins prefix with `can0:` — for example `uart_pin: can0:PA15`.
 
-### 2. StallGuard threshold setup
+### 2. StallGuard tuning
 
-Some StallGuard parameters can't be set directly in the `[tmcXXXX]` section — they need a `delayed_gcode` that runs after Klipper boot:
+The StallGuard sensitivity (`driver_SGT`, `driver_SGTHRS`, or `driver_sg4_thrs` depending on driver) and filter (`driver_SFILT` / `driver_sg4_filt_en`) are set **directly in the `[tmcXXXX]` section** above. No `delayed_gcode` macro is needed — Klipper writes these on every startup.
 
-#### For TMC2240
+#### What value to start with
 
-```ini
-[delayed_gcode setup_extruder_sg]
-initial_duration: 2.0
-gcode:
-    SET_TMC_FIELD STEPPER=extruder FIELD=sg4_thrs VALUE=80
-    SET_TMC_FIELD STEPPER=extruder FIELD=sg4_filt_en VALUE=1
+| Driver | Field | Range | Direction | Starting point |
+|--------|-------|-------|-----------|----------------|
+| TMC2240 | `driver_sg4_thrs` | 0–255 | higher = more sensitive | 80 |
+| TMC2209 | `driver_SGTHRS`   | 0–255 | higher = more sensitive | 100 |
+| TMC5160 / 2130 | `driver_SGT` | −64..+63 (signed) | higher = **less** sensitive (raises SG_RESULT) | 0–6 (start), tune up if SG values are too low |
+| TMC2660 | `driver_SGT` | −64..+63 (signed) | higher = less sensitive | 0 |
+
+Filters (recommended for extruders, smooths the SG signal):
+
+| Driver | Field | Value |
+|--------|-------|-------|
+| TMC2240 | `driver_sg4_filt_en` | `True` |
+| TMC2209 | _(no SG filter on this chip)_ | — |
+| TMC5160 / 2130 / 2660 | `driver_SFILT` | `True` |
+
+#### How to tune
+
+1. **Run the test once** with the starting value and watch the SG values printed live in the Klipper console (e.g. `SG median = 70`).
+2. If the test triggers immediately at very low flow → **lower** sensitivity (TMC2240/2209: lower `sg4_thrs` / `SGTHRS`; TMC5160: raise `SGT`).
+3. If the test reaches `MAX` without triggering → **raise** sensitivity (opposite of step 2).
+4. **For TMC5160 specifically:** if the SG values look very low (median < 50 across all flows) the driver isn't producing useful range. **Raise `SGT` substantially** (e.g. from 0 to 10–20). On a Sherpa Mini extruder, `driver_SGT: 15` produced a clean SG range from ~540 (low load) down to ~90 (high load) — use that as a reference.
+
+#### Verify with `DUMP_TMC`
+
+After `FIRMWARE_RESTART` you can confirm the values are loaded:
+
+```
+DUMP_TMC STEPPER=extruder
 ```
 
-> The `VALUE=80` for `sg4_thrs` is a starting point for typical pancake-style steppers. Higher = more sensitive. Range 0–255. If the test triggers immediately at low flow, lower this value (e.g. 60). If it never triggers, raise it.
-
-#### For TMC2209
-
-```ini
-[delayed_gcode setup_extruder_sg]
-initial_duration: 2.0
-gcode:
-    SET_TMC_FIELD STEPPER=extruder FIELD=sgthrs VALUE=100
-```
-
-> The `VALUE=100` for `sgthrs` is a starting point. Higher = more sensitive. Range 0–255. TMC2209 has no filter field (unlike TMC2240).
-
-#### For TMC5160 (and other SG2 drivers)
-
-The plugin reads `SG_RESULT` directly from `DRV_STATUS` and uses statistical
-triggers, so a non-zero `sgt` is **not strictly required** for the test to
-work. If you also want the hardware stall stop signal, configure it like this:
-
-```ini
-[delayed_gcode setup_extruder_sg]
-initial_duration: 2.0
-gcode:
-    SET_TMC_FIELD STEPPER=extruder FIELD=sgt VALUE=4
-    SET_TMC_FIELD STEPPER=extruder FIELD=sfilt VALUE=1
-```
-
-> `sgt` is a **signed** 7-bit value (-64 to 63) on TMC5160. Higher = more
-> sensitive. Typical starting point is 2–6. `sfilt=1` enables the SG2 filter
-> for cleaner readings (recommended for extruders).
+Look for the `COOLCONF` line — it should show your `sgt`, `sfilt`, `semin`, `semax`, etc.
 
 ### 3. Plugin configuration
 
@@ -430,7 +434,7 @@ Main command. Auto-detects test mode from `driver_SEMIN`:
 | `DURATION`         | 5       | Seconds of extrusion per measurement                           |
 | `REPEAT`           | 5       | Repetitions per flow value (higher = more accurate, slower)    |
 | `VERIFY_REPEATS`   | 5       | Repetitions in Phase 3 (verification)                          |
-| `COOLDOWN`         | 60      | Pause between phases (seconds)                                 |
+| `COOLDOWN`         | 15      | Pause between phases (seconds)                                 |
 | `PURGE`            | 0       | Optional purge before test (mm of filament)                    |
 | `MAX_BISECT_STEPS` | 6       | Maximum bisection iterations                                   |
 | `MODE`             | auto    | `auto`, `sg`, or `cs` to override auto-detection               |
@@ -487,6 +491,7 @@ The HTML report renders in any browser and includes:
 - **Phase markers** — vertical dashed lines at Coarse → Bisection → Verify transitions
 - **Data table** with inter-run consistency (CV) for each measurement
 - **Stop reason** (which trigger fired and at which flow), shown below the result panel
+- **TMC driver settings** captured at the start of the run — collapsible block listing all StallGuard / CoolStep-relevant fields (`SGT`, `SFILT`, `sg4_thrs`, `SEMIN`, `SEMAX`, `TCOOLTHRS`, chopper-mode flags, etc.) so you have a reproducible paper trail of the configuration that produced the result. Same block is appended as a comment header to the CSV file.
 
 ---
 
@@ -543,16 +548,25 @@ UART communication with the TMC2209 isn't working. Not a plugin issue — Klippe
 
 ### "sg4_thrs is 0. StallGuard trigger inactive."
 
-(SG4 drivers only.) The `delayed_gcode setup_extruder_sg` block is missing or didn't run. Check that it's in your `printer.cfg` and run `FIRMWARE_RESTART`.
+(SG4 drivers only.) The `driver_sg4_thrs` (TMC2240) or `driver_SGTHRS` (TMC2209) line is missing from your `[tmcXXXX extruder]` section. Add it and run `FIRMWARE_RESTART`:
 
-For a quick test, set it manually in the console:
+```ini
+# In [tmc2240 extruder]:
+driver_sg4_thrs: 80
+driver_sg4_filt_en: True
+
+# In [tmc2209 extruder]:
+driver_SGTHRS: 100
+```
+
+For a one-off runtime test (won't survive restart), you can also use:
 
 ```
 SET_TMC_FIELD STEPPER=extruder FIELD=sg4_thrs VALUE=80
 SET_TMC_FIELD STEPPER=extruder FIELD=sg4_filt_en VALUE=1
 ```
 
-(For TMC2209: `FIELD=sgthrs VALUE=100` and skip the filter line. SG2 drivers don't need this — the plugin reads SG_RESULT directly from `DRV_STATUS`.)
+(TMC2209: `FIELD=sgthrs VALUE=100` and skip the filter line. SG2 drivers don't need this — the plugin reads SG_RESULT directly from `DRV_STATUS`.)
 
 ### "SG median = n/a" during the test
 
