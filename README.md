@@ -30,11 +30,34 @@ Output: a CSV with raw data and an interactive HTML report with a **decision tra
 
 ## Supported drivers
 
-This plugin supports **TMC5160 (incl. TMC2130)** and **TMC2240** only.
+| Driver | Status | Mode | Detection |
+|---|---|---|---|
+| **TMC5160** (incl. TMC2130) | ✅ Production | SpreadCycle / SG2 | Full SG-magnitude + variance |
+| **TMC2240** | ✅ Production | SpreadCycle / SG2 | Full SG-magnitude + variance |
+| **TMC2209** | ⚠️ Experimental | SpreadCycle / SG4 | CV-spike (variance) only |
 
-Both drivers implement **StallGuard2 (SG2)** which works in **SpreadCycle** chopper mode — the only combination that delivers full motor torque AND a usable load signal at the same time. The plugin runs in this single, well-defined operating mode and is calibrated against it.
+### Production drivers (TMC5160 / TMC2240)
 
-**TMC2209 is not supported.** This isn't a plugin limitation — it's the chip itself. The TMC2209 only implements StallGuard4, which Trinamic designed exclusively for StealthChop chopper mode (per Trinamic [Application Note AN-002](https://www.analog.com/en/resources/app-notes/an-002.html)). StealthChop costs ~50 % peak torque vs. SpreadCycle, so TMC2209 max-flow results would be capped roughly half-way of what the same motor achieves on TMC5160/2240. For a TMC2209 board, the recommended path is to swap to a pin-compatible TMC2240 (~€15) or use a traditional flow-tower print test instead.
+Both implement **StallGuard2 (SG2)** which works in **SpreadCycle** chopper mode — the combination that delivers full motor torque AND a clean load-proportional SG signal. The plugin runs in this single, well-defined operating mode and is validated against historical data.
+
+### Experimental driver (TMC2209)
+
+> ⚠️ **EXPERIMENTAL — read this before using TMC2209**
+>
+> The TMC2209 only implements **StallGuard4 (SG4)**, which Trinamic explicitly designed for StealthChop mode. From the [TMC2209 Datasheet Rev 1.09](https://www.analog.com/media/en/technical-documentation/data-sheets/tmc2209_datasheet_rev1.09.pdf):
+>
+> > *"SG_RESULT becomes updated with each fullstep [...] **Intended for StealthChop mode, only.**"*
+>
+> The plugin runs TMC2209 in **SpreadCycle anyway** to access full motor torque (~100 % vs. ~50 % in StealthChop). This is **outside official Trinamic specification** and works empirically on some hardware combinations but not others.
+>
+> **What this means for you:**
+> - Results are **not** guaranteed reliable across all TMC2209 boards/motors
+> - Some TMC2209 boards (especially budget clones) produce unusable SG4 in SpreadCycle
+> - The plugin uses CV-spike detection (variance jump at slip) instead of SG-magnitude — this works when SG4 is responsive, fails silently when it isn't
+> - You **must** run `TMC_FLOW_TEST_SG_VARIANTS` first to verify your specific hardware works (see [TMC2209 pre-flight check](#tmc2209-pre-flight-check))
+> - Validate any max-flow result with **multiple long real-world prints** before trusting it in your slicer
+>
+> If your TMC2209 doesn't pass the pre-flight check, swap to a pin-compatible TMC2240 (~€15) for guaranteed results, or use a traditional flow-tower print test.
 
 > **Important for TMC2240 users**: The plugin runs the TMC2240 in the **SG2/SpreadCycle path** (same as TMC5160). The TMC2240's SG4/StealthChop path delivers ~50 % less peak torque — it's intended for sensorless homing, not high-flow extrusion. See [TMC2240 config](#tmc2240) below.
 
@@ -131,6 +154,36 @@ driver_SFILT: 1                  # SG2 filter — REQUIRED for clean signal
 
 > **Switching from SG4 to SG2 on TMC2240?** If you previously ran the TMC2240 with `stealthchop_threshold: 999999` and a `SET_TMC_FIELD ... sg4_thrs ...` macro for sensorless homing, you'll need to disable that for the test. The plugin will detect StealthChop in `TMC_FLOW_STATUS` and tell you what to remove.
 
+#### TMC2209 (experimental)
+
+> ⚠️ Read the [Supported drivers](#experimental-driver-tmc2209) and [TMC2209 pre-flight check](#tmc2209-pre-flight-check) sections first.
+
+```ini
+[tmc2209 extruder]
+uart_pin: PB12                   # ADAPT
+run_current: 0.85                # ADAPT — see notes below
+hold_current: 0.5                # keep modest to avoid overheating
+sense_resistor: 0.110            # ADAPT (typical 0.110 on most boards)
+interpolate: false
+# stealthchop_threshold INTENTIONALLY OMITTED — see notes below
+coolstep_threshold: 0.5          # required for StallGuard reads
+driver_SGTHRS: 100               # SG4 threshold
+driver_SEMIN: 0                  # CoolStep off — clean SG signal
+```
+
+**Why no `stealthchop_threshold`?** Omitting this Klipper config option leaves the TMC2209 in **SpreadCycle** mode (the chip's default after Klipper init). This is the experimental setup — SG4 in SpreadCycle is unsupported per Trinamic spec but provides full motor torque and works empirically on many hardware combinations. **Always verify with `TMC_FLOW_TEST_SG_VARIANTS` first.**
+
+If your hardware fails the pre-flight check, you can fall back to the documented (but lower-torque) StealthChop mode by adding:
+```ini
+stealthchop_threshold: 999999    # forces StealthChop — Trinamic-supported but ~50 % torque loss
+```
+
+**Why higher `run_current`?** The TMC2209 typically runs lower currents (0.5-0.7 A) for silent operation. For max-flow testing you want full torque — set 0.85-1.0 A. Watch motor temperature; reduce `hold_current` if the motor heats up during dwell.
+
+**Why `driver_SEMIN: 0`?** Disables CoolStep, which would otherwise modulate motor current during the test and noise up the SG signal.
+
+> **Auto-SGT skipped for TMC2209**: The Auto-SGT calibration phase is only meaningful for SG2 drivers (TMC5160/2130/2240). On TMC2209, `driver_SGTHRS` is the DIAG-pin trigger threshold and doesn't affect SG_RESULT magnitude (per Trinamic spec). The plugin uses your configured value directly.
+
 ### Plugin section
 
 ```ini
@@ -177,6 +230,43 @@ If you're not sure what mode you're in, run `TMC_FLOW_STATUS` — the plugin che
 
 ---
 
+## TMC2209 pre-flight check
+
+> ⚠️ **Mandatory step before TMC2209 max-flow tests.** TMC2209 SG4 in SpreadCycle is unsupported per Trinamic spec. Whether it works on YOUR hardware is empirical — this command tells you.
+
+```
+TMC_FLOW_TEST_SG_VARIANTS LOW_FLOW=30 HIGH_FLOW=140 DURATION=8
+```
+
+The check probes SG_RESULT in **both** StealthChop and SpreadCycle at low flow and high flow, then evaluates whether the variance signature (CV jump from low-load to slip) is detectable.
+
+> **Warning**: At HIGH_FLOW values close to your hotend's limit, the motor will physically slip during the test. This is intentional — we need to see the slip signature. Be ready to stop with `M112` if you hear excessive clacking, and ensure your filament path is clear.
+
+### What "USABLE" means
+
+The plugin reports each mode as USABLE or NOT USABLE based on:
+
+- **CV-spike detected** (CV ratio ≥ 3× between low and high flow, with high CV ≥ 10 %) → real slip will trigger detection
+- **Large SG-magnitude change** (|delta| ≥ 50) → magnitude-based triggers can also work as a backup
+
+### Reading the recommendation
+
+The output ends with a **Recommendation** block telling you which chopper mode to use. Three typical outcomes:
+
+**Both modes USABLE, SpreadCycle stronger** — best case. SpreadCycle gives full torque AND a clean slip signal. Omit `stealthchop_threshold` from your config.
+
+**Only StealthChop USABLE** — your hardware doesn't produce reliable SG4 in SpreadCycle. Add `stealthchop_threshold: 999999` to your config and accept ~50 % torque loss.
+
+**Neither mode USABLE** — your TMC2209 hardware can't produce a usable SG4 signal for this purpose. Try increasing `run_current`, increase HIGH_FLOW so the motor actually reaches stall, or accept that this hardware combo isn't suitable. As a last resort, swap to TMC2240 or use a flow-tower print.
+
+### Caveats even when "USABLE"
+
+- The TMC2209 SG signal is much noisier than SG2. The plugin uses tighter CV-based triggers than for TMC5160/2240 to compensate, but borderline measurements may need re-testing.
+- SG_RESULT magnitude on TMC2209 often goes the "wrong direction" (rises with load instead of falling). The plugin's CV-spike triggers are direction-agnostic and work regardless.
+- Always validate the final max-flow value with **multiple long real-world prints** before configuring it as your slicer's max volumetric speed.
+
+---
+
 ## How it works
 
 The plugin samples StallGuard at 20 Hz during each measurement step (5 repeats × 5 s by default) and tracks median, IQR (P25–P75), and run-to-run CV per step. Slip detection uses **multiple independent triggers** that look for different signatures:
@@ -202,6 +292,11 @@ Each driver family has its own `TriggerProfile` in the source code with all dete
 - **TMC2240Profile** — inherits TMC5160 base, with TMC2240-specific overrides:
   - `WARMUP_DRIFT_THRESHOLD = 0.04` — catches the systematic first-run drift
   - `PLATEAU_RATIO = 0.2` — the SG2 saturation curve is steeper on TMC2240
+- **TMC2209Profile** *(experimental)* — fundamentally different detection strategy from SG2:
+  - SG-magnitude triggers (snap-back, plateau, max-spike) **DISABLED** — SG4 doesn't follow the SG2 "smooth load curve" model
+  - CV-spike triggers as primary slip indicator (`CV_HIGH_VARIANCE = 12.0` vs. 5.0 for SG2)
+  - IQR triggers calibrated for the 0-510 SG4 scale (`IQR_ABSOLUTE_TRIGGER = 50` vs. 25 for SG2)
+  - `WARMUP_DRIFT_THRESHOLD = 0.15` — SG4 has higher first-run drift
 
 To tune sensitivity for one driver without affecting the others, edit only its profile class.
 
@@ -238,12 +333,24 @@ Diagnostic check: reads current SG value, verifies driver, chopper mode, and Sta
 |---|---|---|
 | `ACTIVATE` | 1 | Briefly run motor (1 mm extrusion) so SG can be read |
 
+### `TMC_FLOW_TEST_SG_VARIANTS` *(TMC2209 only)*
+
+Empirical pre-flight check: probes SG_RESULT in both StealthChop and SpreadCycle to determine which mode produces a usable slip signal on YOUR hardware. **Mandatory before relying on max-flow results from a TMC2209.**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `LOW_FLOW` | 5 | Low-load probe flow (mm³/s) |
+| `HIGH_FLOW` | 20 | High-load probe flow (mm³/s) — set this near or above your hotend's expected slip point |
+| `DURATION` | 5 | Seconds per probe |
+| `REPEAT` | 5 | Repetitions per probe |
+| `SGTHRS` | 100 | Temporary SGTHRS used for the test (your config is restored after) |
+
 ---
 
 ## Examples
 
 ```
-# Standard test (Auto-SGT on by default)
+# Standard test (TMC5160/2240 with Auto-SGT on by default)
 TMC_FLOW_FIND_MAX MAX=150 START=10
 
 # Same test, but keep the tuned SGT after test ends
@@ -260,6 +367,12 @@ TMC_FLOW_FIND_MAX REPEAT=10 DURATION=8 VERIFY_REPEATS=10
 
 # Diagnostic check
 TMC_FLOW_STATUS
+
+# TMC2209 pre-flight check (always run this first on TMC2209)
+TMC_FLOW_TEST_SG_VARIANTS LOW_FLOW=30 HIGH_FLOW=140 DURATION=8
+
+# TMC2209 main test (Auto-SGT auto-disabled, START=30 to skip SG4 bias region)
+TMC_FLOW_FIND_MAX MAX=150 START=30 AUTO_SGT=0
 ```
 
 ---
@@ -311,6 +424,29 @@ The plugin works fine with CoolStep on, but for the most conservative result set
 
 **Auto-SGT keeps tuning to the same value as my config** —
 That's fine — it confirms your SGT is already optimal. The console will say "current SGT=N already optimal — no change needed".
+
+### TMC2209-specific (experimental)
+
+**`TMC_FLOW_TEST_SG_VARIANTS` reports both modes "NOT USABLE"** —
+Possible causes:
+1. HIGH_FLOW too low — motor never reaches actual stall. Increase HIGH_FLOW until you hear physical clacking during the test.
+2. `run_current` too low — motor has too much torque headroom to slip. Try 0.85-1.0 A.
+3. SG_RESULT stays at 0 or one fixed value across both modes → hardware-level SG4 problem (some TMC2209 clones have non-functional SG4). Try a different TMC2209 board or switch to TMC2240.
+
+**TMC2209 SG values seem to "go the wrong way"** (rise with load instead of fall) —
+That's normal on TMC2209 SG4. The Trinamic spec says higher SG = lower load, but in practice on many TMC2209 boards SG_RESULT magnitude is unreliable. The plugin's CV-spike triggers are direction-agnostic and detect slip regardless. As long as the pre-flight check reports "USABLE", the main test will work.
+
+**TMC2209 main test ends very early or very late** —
+The CV-based triggers tuned in `TMC2209Profile` are necessarily looser than for SG2 to handle SG4 noise. If borderline measurements seem off, try:
+- Higher `REPEAT` (e.g. 10) for tighter run-to-run statistics
+- Higher `VERIFY_REPEATS` (e.g. 10) for more confident verification
+- Verify with multiple long real-world prints — TMC2209 results are inherently less reliable than SG2
+
+**TMC2209 main test passes but real prints under-extrude at the recommended flow** —
+Expected risk with the experimental TMC2209 path. The Trinamic-supported way is StealthChop only (and ~50 % torque loss). Either:
+1. Drop the slicer max-flow value 20 % below what the plugin reported
+2. Re-test with `stealthchop_threshold: 999999` for the conservative documented mode
+3. Switch to TMC2240 for a guaranteed-reliable result
 
 ---
 
