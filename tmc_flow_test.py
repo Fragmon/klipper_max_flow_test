@@ -198,23 +198,43 @@ class TMCFlowTest:
                      '  stealthchop_threshold: 999999' % tpwmthrs))
         elif self.sg2_driver:
             # TMC5160 / TMC2130 / TMC2660 — SG2 requires SpreadCycle.
+            #
+            # Klipper's tmc.py writes tpwmthrs = 0xFFFFF (= 1048575) as the
+            # default when stealthchop_threshold is NOT set in the config —
+            # together with en_pwm_mode=0 this is the "SpreadCycle at all
+            # speeds" state we actually want for SG2. So:
+            #
+            #   • en_pwm_mode is the authoritative signal: 0 = SpreadCycle.
+            #   • Only flag tpwmthrs when en_pwm_mode is 1 AND tpwmthrs is in
+            #     the mid-range (0 < tpwmthrs < 0xFFFFF), which would make
+            #     the driver switch chopper mode based on velocity.
+            #   • tpwmthrs == 0xFFFFF means "never enter StealthChop" and is
+            #     the Klipper default → not a problem.
+            stealthchop_default_tpwmthrs = 0xFFFFF  # 1048575
             if en_pwm_mode is not None and en_pwm_mode == 1:
-                problems.append(
-                    ('en_pwm_mode', en_pwm_mode,
-                     'StealthChop is active. %s StallGuard2 only works in '
-                     'SpreadCycle mode.\n'
-                     'Remove (or set to 0) in your [%s extruder] section:\n'
-                     '  stealthchop_threshold: 0'
-                     % (self.driver_type.upper(), self.driver_type)))
-            elif tpwmthrs is not None and tpwmthrs > 0:
-                problems.append(
-                    ('tpwmthrs', tpwmthrs,
-                     '%s StallGuard2 needs SpreadCycle at all speeds, but '
-                     'tpwmthrs=%d enables StealthChop below that velocity.\n'
-                     'Remove stealthchop_threshold from your [%s extruder] '
-                     'section (or set it to 0).'
-                     % (self.driver_type.upper(), tpwmthrs,
-                        self.driver_type)))
+                if (tpwmthrs is not None and 0 < tpwmthrs
+                        < stealthchop_default_tpwmthrs):
+                    problems.append(
+                        ('tpwmthrs', tpwmthrs,
+                         '%s StallGuard2 needs SpreadCycle at all speeds, '
+                         'but tpwmthrs=%d enables StealthChop below that '
+                         'velocity.\n'
+                         'Remove stealthchop_threshold from your [%s '
+                         'extruder] section (or set it to 0).'
+                         % (self.driver_type.upper(), tpwmthrs,
+                            self.driver_type)))
+                else:
+                    problems.append(
+                        ('en_pwm_mode', en_pwm_mode,
+                         'StealthChop is active. %s StallGuard2 only works '
+                         'in SpreadCycle mode.\n'
+                         'Remove stealthchop_threshold from your [%s '
+                         'extruder] section (do not set it to 0 — remove '
+                         'the line).'
+                         % (self.driver_type.upper(), self.driver_type)))
+            # else: en_pwm_mode == 0 → SpreadCycle is active. tpwmthrs is
+            # irrelevant in this case (the driver never enters StealthChop),
+            # whether it's 0 or 0xFFFFF.
 
         # ─── tcoolthrs check (StallGuard gate) ───
         if tcoolthrs == 0:
@@ -491,8 +511,17 @@ class TMCFlowTest:
                         '|'.join("%.1f" % v for v in run_sg),
                     ))
 
-    def _write_html(self, path, results, meta, limit_reason, mode):
-        """Compact HTML report with chart."""
+    def _write_html(self, path, results, meta, limit_reason, mode,
+                    final_result=None):
+        """Compact HTML report with chart.
+
+        final_result (optional dict): when present, renders the prominent
+        result panel with the optimal flow value. Expected keys:
+            max_safe (float)         -- mm³/s, the optimal value
+            verify_cv (float)        -- run-to-run CV in percent
+            quality (str)            -- e.g. 'good (stable)'
+            stop_reason (str|None)   -- last trigger reason (optional)
+        """
         flows = [r['flow'] for r in results]
         phases = [r.get('phase', 'coarse') for r in results]
         sg_label = self._get_sg_label()
@@ -528,7 +557,40 @@ new Chart(document.getElementById('csChart'), {
 });
 """ % json.dumps(cs_median)
 
-        if limit_reason:
+        if final_result is not None:
+            max_safe = final_result.get('max_safe')
+            verify_cv = final_result.get('verify_cv', 0.0)
+            quality = final_result.get('quality', '')
+            stop_reason = final_result.get('stop_reason')
+
+            stop_html = ''
+            if stop_reason:
+                stop_html = (
+                    '<div class="stop-line">Stop trigger that ended the '
+                    'search: <em>%s</em></div>' % stop_reason)
+
+            summary_html = (
+                '<div class="summary final">'
+                '<h2>Maximum Safe Volumetric Flow</h2>'
+                '<div class="big-number">%.1f<span class="unit">'
+                'mm³/s</span></div>'
+                '<div class="quality-line">Verification quality: '
+                '<strong>%s</strong> (CV = %.1f%%)</div>'
+                '<div class="recommendations">'
+                '<div class="rec-table">'
+                '<span class="rec-label">Conservative (80%%)</span>'
+                '<span class="rec-value">%.1f mm³/s</span>'
+                '<span class="rec-note">recommended for slicer</span>'
+                '<span class="rec-label">Aggressive (90%%)</span>'
+                '<span class="rec-value">%.1f mm³/s</span>'
+                '<span class="rec-note">only with margin</span>'
+                '</div>'
+                '</div>'
+                '%s'
+                '</div>'
+                % (max_safe, quality, verify_cv,
+                   max_safe * 0.8, max_safe * 0.9, stop_html))
+        elif limit_reason:
             summary_html = (
                 '<div class="summary"><h2>Result</h2>'
                 '<p>Stop reason: <strong>%s</strong></p></div>'
@@ -615,6 +677,28 @@ h1 { color: #1565c0; }
 .summary { background: #e3f2fd; padding: 15px; border-radius: 8px;
            margin-bottom: 20px; border-left: 4px solid #1976d2; }
 .summary h2 { margin: 0 0 10px 0; color: #1976d2; }
+.summary.final { background: linear-gradient(135deg, #e8f5e9 0%%, #c8e6c9 100%%);
+                 border-left: 6px solid #2e7d32; padding: 24px 28px; }
+.summary.final h2 { color: #1b5e20; font-size: 22px;
+                    margin: 0 0 6px 0; }
+.big-number { font-size: 46px; font-weight: 700; color: #1b5e20;
+              line-height: 1.1; margin: 8px 0 4px 0;
+              font-variant-numeric: tabular-nums; }
+.big-number .unit { font-size: 22px; font-weight: 500;
+                    color: #2e7d32; margin-left: 6px; }
+.quality-line { color: #2e7d32; font-size: 14px; margin-bottom: 14px; }
+.recommendations { margin-top: 16px; padding-top: 14px;
+                   border-top: 1px solid rgba(46,125,50,0.25); }
+.rec-table { display: grid;
+             grid-template-columns: auto auto 1fr;
+             gap: 6px 14px; align-items: baseline; font-size: 14px; }
+.rec-label { color: #1b5e20; font-weight: 600; }
+.rec-value { font-variant-numeric: tabular-nums; font-weight: 600;
+             color: #1b5e20; }
+.rec-note { color: #2e7d32; font-size: 13px; }
+.stop-line { margin-top: 12px; padding-top: 10px; font-size: 13px;
+             color: #4e6e54;
+             border-top: 1px dashed rgba(46,125,50,0.3); }
 .chart-container { background: white; padding: 20px;
                    border-radius: 8px; margin-bottom: 20px;
                    box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
@@ -757,7 +841,8 @@ new Chart(document.getElementById('sgChart'), {
             f.write(rendered)
 
     def _save_report(self, results, meta, timestamp, limit_reason,
-                     no_html, mode, gcmd=None, announce=True):
+                     no_html, mode, gcmd=None, announce=True,
+                     final_result=None):
         """Save CSV and HTML report. Safe to call repeatedly."""
         if not results:
             return
@@ -772,7 +857,8 @@ new Chart(document.getElementById('sgChart'), {
                 html_path = os.path.join(
                     self.output_dir,
                     'tmc_flow_%s_%s.html' % (mode, timestamp))
-                self._write_html(html_path, results, meta, limit_reason, mode)
+                self._write_html(html_path, results, meta, limit_reason,
+                                 mode, final_result=final_result)
                 if announce and gcmd is not None:
                     gcmd.respond_info("HTML saved: %s" % html_path)
         except Exception as e:
@@ -881,13 +967,45 @@ new Chart(document.getElementById('sgChart'), {
 
     # ─── Trigger detection — SG-only mode ──────────────────────────
 
-    def _check_triggers_sg(self, results):
-        """SG-only triggers: for setups with CoolStep disabled.
+    def _sg_min_informative(self):
+        """Lowest SG value still considered informative.
 
-        Two triggers, both require SG > 50 (informative range) and only
-        fire when stepping UP:
-          1. SG abnormal jump: actual > 2x expected AND > +15
-          2. SG plateau over 2 steps: cumulative rise < 0.5x expected
+        For SG4 drivers (TMC2240/2209) low SG values mean 'almost no
+        load' and are noisy; we ignore them. For SG2 drivers (TMC5160 et
+        al.) low SG means HIGH load — exactly the regime we care about
+        — so don't gate on it.
+        """
+        if self.sg2_driver:
+            return -1  # never reject on this gate
+        return SG_MIN_INFORMATIVE
+
+    def _sg_jump_threshold(self):
+        """Minimum raw |SG delta| considered a real (non-noise) jump.
+
+        SG4 (TMC2240/2209) operates in a 0-510 range, slip jumps are
+        typically >30 raw units. SG2 (TMC5160 etc.) often runs in a
+        narrower 0-150 range; jumps as small as 5-10 can signal a slip.
+        """
+        if self.sg2_driver:
+            return 5
+        return 15
+
+    def _check_triggers_sg(self, results):
+        """SG-based slip detection.
+
+        SG can either RISE or FALL with increasing motor load depending on
+        driver chip, chopper mode, motor, and CoolStep state. Rather than
+        hard-coding a direction per driver, we let the data decide:
+        average sign of the recent step-to-step deltas tells us which way
+        SG is trending. A slip then shows up as a sharp move in the
+        OPPOSITE direction (motor decouples from load → SG snaps back to
+        its 'no-load' value).
+
+        Two triggers, both fire only when stepping UP:
+          1. SG reload jump: SG moves against the established trend by
+             more than the typical step magnitude (and >15 raw units)
+          2. Plateau over 2 steps: the trend stalls — cumulative
+             trend-direction movement is less than half the typical
         """
         if not results or len(results) < 5:
             return None
@@ -897,14 +1015,16 @@ new Chart(document.getElementById('sgChart'), {
             return None
         sg_med = sg_stats['median']
         target_flow = r['flow']
+        sg_label = self._get_sg_label()
 
-        if sg_med <= SG_MIN_INFORMATIVE:
+        if sg_med <= self._sg_min_informative():
             return None
 
         prev_flow = results[-2].get('flow', 0)
         if target_flow < prev_flow - 0.001:
             return None  # bisection going down: don't trigger
 
+        # Raw step-to-step SG deltas from recent history.
         sg_deltas = []
         for j in range(max(1, len(results) - 5), len(results) - 1):
             rj, rj_prev = results[j], results[j-1]
@@ -918,32 +1038,119 @@ new Chart(document.getElementById('sgChart'), {
         expected_delta = sum(sg_deltas) / len(sg_deltas)
         actual_delta = sg_med - results[-2]['sg']['median']
 
-        sg_label = self._get_sg_label()
+        # Trend direction (+1 = SG rises with load, -1 = SG falls with
+        # load, 0 = flat / inconclusive). Use 1 raw unit as the
+        # noise-floor so a tiny non-zero average doesn't lock us into a
+        # spurious sign.
+        if expected_delta > 1.0:
+            trend_sign = +1
+        elif expected_delta < -1.0:
+            trend_sign = -1
+        else:
+            trend_sign = 0
 
-        # Trigger 1: SG abnormal jump
-        if (expected_delta > 0
-                and actual_delta > expected_delta * 2.0
-                and actual_delta > 15):
-            return ("%s abnormal jump: +%.0f vs expected +%.0f "
-                    "(%.1fx larger) — slip detected"
-                    % (sg_label, actual_delta, expected_delta,
-                       actual_delta / expected_delta))
+        # In trend-direction terms, slip can manifest two ways:
+        #   • "Over-jump"   — load_signal jumps in the same direction as
+        #                      the trend, but >2× the typical step. This
+        #                      is what TMC2240/2209 (SG4) often show
+        #                      empirically: SG keeps rising but suddenly
+        #                      MUCH faster than before.
+        #   • "Snap-back"   — load_signal moves OPPOSITE to the trend
+        #                      (motor decouples, SG returns toward its
+        #                      no-load value). This is the textbook SG2
+        #                      stall signature seen on TMC5160 etc.
+        # Both should fire; we test each independently.
+        if trend_sign != 0:
+            expected_load = expected_delta * trend_sign     # > 0
+            actual_load = actual_delta * trend_sign         # any sign
 
-        # Trigger 2: SG plateau over 2 steps
-        if expected_delta > 5:
-            prev_actual = (results[-2]['sg']['median']
-                           - results[-3]['sg']['median'])
-            cumulative_2step = actual_delta + prev_actual
-            expected_2step = expected_delta * 2
-            if cumulative_2step < expected_2step * 0.5:
-                return ("%s plateau over 2 steps: rose only +%.0f "
-                        "vs typical +%.0f — flow no longer increasing "
-                        "motor load (slip starting)"
-                        % (sg_label, cumulative_2step, expected_2step))
+            # Snap-back (slip via decoupling)
+            if (actual_load < -expected_load
+                    and abs(actual_delta) > self._sg_jump_threshold()):
+                if trend_sign > 0:
+                    return ("%s reload jump: %+.0f (expected to keep "
+                            "rising ~+%.0f) — slip detected"
+                            % (sg_label, actual_delta, expected_load))
+                return ("%s reload jump: %+.0f (expected to keep "
+                        "falling ~-%.0f) — slip detected"
+                        % (sg_label, actual_delta, expected_load))
+
+            # Over-jump (slip via abnormal acceleration)
+            if (actual_load > expected_load * 2.0
+                    and abs(actual_delta) > self._sg_jump_threshold()):
+                if trend_sign > 0:
+                    return ("%s abnormal jump: %+.0f vs expected "
+                            "~+%.0f (%.1fx larger) — slip detected"
+                            % (sg_label, actual_delta, expected_load,
+                               actual_load / expected_load))
+                return ("%s abnormal drop: %+.0f vs expected ~-%.0f "
+                        "(%.1fx larger) — slip detected"
+                        % (sg_label, actual_delta, expected_load,
+                           actual_load / expected_load))
+
+            # Trigger 2: plateau over 2 steps, only meaningful when the
+            # trend is sizeable.
+            if expected_load > 5:
+                prev_actual = (results[-2]['sg']['median']
+                               - results[-3]['sg']['median'])
+                cumulative_load = (actual_load
+                                   + prev_actual * trend_sign)
+                expected_2step = expected_load * 2
+                if cumulative_load < expected_2step * 0.5:
+                    direction = ("rising" if trend_sign > 0
+                                 else "falling")
+                    return ("%s plateau over 2 steps: %s trend stalled "
+                            "(only %.0f vs typical %.0f load-units) — "
+                            "flow no longer increasing motor load "
+                            "(slip starting)"
+                            % (sg_label, direction,
+                               cumulative_load, expected_2step))
+
+        # Trigger 3: run-to-run CV spike. Intermittent slip shows up as
+        # a sudden burst of variance between repeats at the same flow,
+        # even when the median doesn't move much. Fire when the latest
+        # CV is both elevated in absolute terms AND much higher than the
+        # baseline of recent steps.
+        cv_reason = self._check_cv_spike(results, sg_label)
+        if cv_reason:
+            return cv_reason
 
         return None
 
-    # ─── Trigger detection — CoolStep + SG mode ────────────────────
+    def _check_cv_spike(self, results, sg_label):
+        """Detect a run-to-run CV spike — intermittent slip signature.
+
+        A clean motor produces tight repeats (CV < 5%). When the motor
+        starts intermittently slipping, individual repeats diverge
+        sharply, even if the median across all samples looks 'normal'.
+        We require:
+          - latest CV >= 10% (elevated in absolute terms)
+          - latest CV >= 2x the average of the previous 3 CVs (jump)
+          - at least 4 prior steps with CV data (statistical baseline)
+        """
+        last = results[-1]
+        last_rc = last.get('run_consistency') or {}
+        if 'sg_cv' not in last_rc:
+            return None
+        last_cv = last_rc['sg_cv']
+        if last_cv < 10.0:
+            return None
+
+        prior_cvs = []
+        for r in results[-4:-1]:  # the 3 immediately prior steps
+            rc = r.get('run_consistency') or {}
+            if 'sg_cv' in rc:
+                prior_cvs.append(rc['sg_cv'])
+        if len(prior_cvs) < 3:
+            return None
+
+        avg_prior_cv = sum(prior_cvs) / len(prior_cvs)
+        if last_cv >= 2.0 * avg_prior_cv:
+            return ("run-to-run %s CV spiked to %.1f%% (baseline "
+                    "~%.1f%% over previous 3 steps) — repeats "
+                    "diverging, intermittent slip"
+                    % (sg_label, last_cv, avg_prior_cv))
+        return None
 
     def _check_triggers_cs(self, results, baseline_cs):
         """CoolStep + SG triggers (Mode A + B fallback).
@@ -1033,7 +1240,7 @@ new Chart(document.getElementById('sgChart'), {
         # ─── SG fallback / backup ───
         if (going_up_or_same
                 and sg_med is not None
-                and sg_med > SG_MIN_INFORMATIVE
+                and sg_med > self._sg_min_informative()
                 and len(results) >= 4):
             sg_deltas = []
             for j in range(max(1, len(results) - 5), len(results) - 1):
@@ -1054,13 +1261,55 @@ new Chart(document.getElementById('sgChart'), {
             if len(sg_deltas) >= 3:
                 expected_delta = sum(sg_deltas) / len(sg_deltas)
                 actual_delta = (sg_med - results[-2]['sg']['median'])
-                if (expected_delta > 0
-                        and actual_delta > expected_delta * 2.0
-                        and actual_delta > 15):
-                    return ("%s abnormal jump: +%.0f vs expected +%.0f "
-                            "(%.1fx larger) — slip detected"
-                            % (sg_label, actual_delta, expected_delta,
-                               actual_delta / expected_delta))
+
+                # Detect trend direction from the data, then look for
+                # a sharp move opposite to the trend.
+                if expected_delta > 1.0:
+                    trend_sign = +1
+                elif expected_delta < -1.0:
+                    trend_sign = -1
+                else:
+                    trend_sign = 0
+
+                if trend_sign != 0:
+                    expected_load = expected_delta * trend_sign
+                    actual_load = actual_delta * trend_sign
+
+                    # Snap-back
+                    if (actual_load < -expected_load
+                            and abs(actual_delta) > self._sg_jump_threshold()):
+                        if trend_sign > 0:
+                            return ("%s reload jump: %+.0f (expected "
+                                    "to keep rising ~+%.0f) — slip "
+                                    "detected"
+                                    % (sg_label, actual_delta,
+                                       expected_load))
+                        return ("%s reload jump: %+.0f (expected to "
+                                "keep falling ~-%.0f) — slip detected"
+                                % (sg_label, actual_delta,
+                                   expected_load))
+
+                    # Over-jump
+                    if (actual_load > expected_load * 2.0
+                            and abs(actual_delta) > self._sg_jump_threshold()):
+                        if trend_sign > 0:
+                            return ("%s abnormal jump: %+.0f vs "
+                                    "expected ~+%.0f (%.1fx larger) — "
+                                    "slip detected"
+                                    % (sg_label, actual_delta,
+                                       expected_load,
+                                       actual_load / expected_load))
+                        return ("%s abnormal drop: %+.0f vs expected "
+                                "~-%.0f (%.1fx larger) — slip detected"
+                                % (sg_label, actual_delta,
+                                   expected_load,
+                                   actual_load / expected_load))
+
+        # CV spike fallback — also fires in CS mode
+        if going_up_or_same:
+            cv_reason = self._check_cv_spike(results, sg_label)
+            if cv_reason:
+                return cv_reason
 
         return None
 
@@ -1473,6 +1722,53 @@ new Chart(document.getElementById('sgChart'), {
         else:
             quality = "poor (high variation — re-run advised)"
 
+        # ─── CoolStep diagnostic (only in CS mode) ───
+        # If CS_ACTUAL stayed pinned at 31 throughout the test, CoolStep
+        # never had a chance to regulate. Per Trinamic AN-002, that
+        # means SG_RESULT was always below SEMIN*32, so SEMIN is set
+        # too high for this motor / load. Recommend a better value.
+        if mode == 'cs':
+            cs_meds = [r['cs']['median'] for r in results
+                       if r.get('cs') and r['cs'].get('n', 0) > 0]
+            sg_meds = [r['sg']['median'] for r in results
+                       if r.get('sg') and r['sg'].get('n', 0) > 0]
+            if (cs_meds and sg_meds
+                    and max(cs_meds) - min(cs_meds) < 1.0
+                    and min(cs_meds) >= 30):
+                sg_max_seen = max(sg_meds)
+                cur_semin = self._read_cs_semin()
+                # AN-002: SEMIN ≈ SG_MAX/4..SG_MAX/8
+                # Lower threshold to ramp current UP is SEMIN*32, so we
+                # want SEMIN*32 to be just above SG_MAX_seen so CoolStep
+                # has room to regulate down when load drops.
+                rec_semin = max(1, int(round(sg_max_seen / 32.0)) + 1)
+                gcmd.respond_info(
+                    "\n----- CoolStep diagnostic -----\n"
+                    "CS_ACTUAL stayed pinned at %.0f for the whole "
+                    "test (range %.1f).\n"
+                    "Your SG_RESULT range was %.0f-%.0f; with "
+                    "driver_SEMIN = %d the CoolStep ramp-up\n"
+                    "threshold is SEMIN*32 = %d, which sits ABOVE "
+                    "every SG value seen — so CoolStep is in\n"
+                    "permanent 'ramp current up' mode and never "
+                    "regulates. Slip detection in this run\n"
+                    "relied on the SG fallback path, which still "
+                    "works fine.\n"
+                    "\n"
+                    "If you want CoolStep to actually regulate (per "
+                    "Trinamic AN-002, SEMIN ≈ SG_MAX/4..SG_MAX/8),\n"
+                    "try in your [%s extruder] section:\n"
+                    "  driver_SEMIN: %d\n"
+                    "  driver_SEMAX: 4\n"
+                    "  driver_SEUP:  3\n"
+                    "  driver_SEDN:  1\n"
+                    "Then FIRMWARE_RESTART and re-run."
+                    % (max(cs_meds),
+                       max(cs_meds) - min(cs_meds),
+                       min(sg_meds), sg_max_seen,
+                       cur_semin, cur_semin * 32,
+                       self.driver_type, rec_semin))
+
         gcmd.respond_info(
             "\n========== FINAL RESULT ==========\n"
             "Test mode: %s\n"
@@ -1489,7 +1785,13 @@ new Chart(document.getElementById('sgChart'), {
                max_safe * 0.8, max_safe * 0.9))
 
         self._save_report(results, meta, timestamp, last_trigger_reason,
-                          no_html, mode, gcmd=gcmd)
+                          no_html, mode, gcmd=gcmd,
+                          final_result={
+                              'max_safe': max_safe,
+                              'verify_cv': verify_cv,
+                              'quality': quality,
+                              'stop_reason': last_trigger_reason,
+                          })
         self.gcode.run_script_from_command("G92 E0")
 
 
