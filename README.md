@@ -83,7 +83,7 @@ The exact numbers don't have to match — what matters is that you have **at lea
 - Increase `coolstep_threshold` slightly (e.g. from `0.5` to `1.0`) — gates StallGuard above a minimum velocity, suppresses noise during ramps.
 - Enable the SG filter: `driver_SFILT: True` (TMC5160) or `driver_sg4_filt_en: True` (TMC2240). Smooths over 4 full-steps.
 
-**A tested reference for TMC5160** (Sherpa Mini, 0.85 A, PLA at 230 °C): `driver_SGT: 15` produces SG ≈ 540 at 20 mm³/s and SG ≈ 90 at 110 mm³/s. Use this as a starting point.
+**A tested reference for TMC5160** (Chube Air, Sherpa Mini, 0.85 A, PLA at 230 °C): `driver_SGT: 15` produces SG ≈ 540 at 20 mm³/s and SG ≈ 90 at 110 mm³/s. Use this as a starting point.
 
 See [StallGuard tuning](#2-stallguard-tuning) below for the complete tuning workflow.
 
