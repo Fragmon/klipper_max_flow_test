@@ -290,20 +290,6 @@ The plugin works fine with CoolStep on, but for the most conservative result set
 
 ---
 
-## How is this different from a flow tower print?
-
-| Flow tower print | TMC Flow Test |
-|---|---|
-| Visually inspect for under-extrusion | Reads motor's actual load signal |
-| Subjective threshold | Objective StallGuard data |
-| Wastes filament + ~1 hour | Minimal filament, ~10 minutes |
-| One value per test | Full statistical profile + decision trail |
-| Tells you when extrusion *looks* bad | Tells you when the *motor is starting to slip* |
-
-Both methods measure different things — the motor can slip before extrusion looks bad (under-extrusion), or extrusion can look bad before the motor slips (cooling / pressure issues). For maximum-flow tuning where torque is the limit, this plugin is the more direct measurement.
-
----
-
 ## Credits & License
 
 Released under the **GNU GPL v3.0**. See [LICENSE](LICENSE).
