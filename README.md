@@ -25,13 +25,6 @@ The plugin reads the TMC driver's **StallGuard** load signal during extrusion to
 
 Output: a CSV with raw data and an interactive HTML report with a **decision trail** (every trigger that fired, why, and which value defined the result).
 
-Real-world results on a Sherpa Mini extruder:
-
-| Driver | Mode | Max safe flow |
-|---|---|---|
-| TMC2240 | StealthChop, 0.85 A | **57 mm³/s** |
-| TMC5160 | SpreadCycle, 0.85 A | **116 mm³/s** |
-
 ---
 
 ## Quick start
