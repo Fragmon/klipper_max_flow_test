@@ -25,14 +25,6 @@ The plugin reads the TMC driver's **StallGuard** load signal during extrusion to
 
 Output: a CSV with raw data and an interactive HTML report with a **decision trail** (every trigger that fired, why, and which value defined the result).
 
-Real-world results on a Sherpa Mini extruder (run_current 0.85 A):
-
-| Driver | Mode | Max safe flow |
-|---|---|---|
-| TMC5160 | SpreadCycle / SG2 | **~110 mm³/s** |
-| TMC2240 | SpreadCycle / SG2 | **~110 mm³/s** |
-| TMC2240 | StealthChop / SG4 | ~60 mm³/s *(not recommended)* |
-
 > **Important for TMC2240 users**: The plugin runs the TMC2240 in the **SG2/SpreadCycle path** (same as TMC5160). The TMC2240's SG4/StealthChop path delivers ~50 % less peak torque — it's intended for sensorless homing, not high-flow extrusion. See [TMC2240 config](#tmc2240) below.
 
 ---
