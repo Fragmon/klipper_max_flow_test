@@ -132,6 +132,21 @@ class TriggerProfile:
     # saturation slope. Lower this fraction for TMC2240.
     PLATEAU_RATIO = 0.5             # cumulative-load < this × expected_2step
 
+    # ─── Plateau saturation-skip threshold ─────────────────────────
+    # The plateau trigger compares the current step's SG-delta to the
+    # average of the prior 3 deltas. If any prior step had SG values
+    # close to the 1023 saturation ceiling, those step's delta is
+    # artificially inflated (clipping artefact) — and the plateau
+    # trigger then thinks "load should have dropped MUCH more than
+    # it did" and falsely fires on naturally saturating curves.
+    #
+    # Skip plateau evaluation entirely if any prior SG median exceeds
+    # this threshold. The validated TMC5160 11-37-30 baseline has
+    # max prior SG ~536 (well below 700). A test starting at flow=10
+    # with SGT≥15 typically sees SG=850-1023 on the first step —
+    # that's the case we need to skip.
+    PLATEAU_SATURATION_SKIP = 700   # skip plateau if prior SG > this
+
     # ─── Warmup-skip threshold ─────────────────────────────────────
     # Per-step, the first repetition often shows different SG behaviour
     # than the others (motor transitions from cold-stop to extruding,
@@ -144,6 +159,33 @@ class TriggerProfile:
     # warmup, the run-outlier trigger fires repeatedly on these
     # warmup runs and aborts the test far below real slip.
     WARMUP_DRIFT_THRESHOLD = 0.10   # 10 % default (TMC5160 baseline)
+
+    # ─── Auto-SGT-tuning ranges (SG2 drivers) ──────────────────────
+    # Used by the optional pre-test SGT auto-tuning phase. Values
+    # apply to drivers using the signed `sgt` field (TMC5160, TMC2130,
+    # TMC2240 in SG2 mode). TMC2209 (SG4) uses different field/range
+    # and is not auto-tuned in this version.
+    #
+    # Probe strategy: extrude AT the user's START flow (the same flow
+    # the test will begin coarse sweeping from). Calibrating SGT for
+    # exactly this load gives the most representative SG-vs-load
+    # baseline — which matters because SGT effects are flow-dependent
+    # and a probe-derived SGT only matches the test if the probe flow
+    # matches the start flow.
+    #
+    # Targets are evaluated at the start-flow load:
+    #   - SGT_LOW_TARGET_MIN: SG should be at least this for adequate
+    #                         dynamic range. Below → bump SGT up.
+    #   - SGT_LOW_TARGET_MAX: SG should NOT exceed this. Slightly
+    #                         below the 1023 saturation ceiling so a
+    #                         truly-saturated reading is detected.
+    SGT_LOW_TARGET_MIN = 600        # SG at start_flow ≥ this
+    SGT_LOW_TARGET_MAX = 1022       # SG at start_flow ≤ this (1023=saturated)
+    SGT_RANGE_MIN = -64             # absolute SGT lower bound (SG2)
+    SGT_RANGE_MAX = 63              # absolute SGT upper bound (SG2)
+    SGT_AUTOTUNE_PROBE_DURATION = 5.0  # seconds per probe (matches test)
+    SGT_AUTOTUNE_PROBE_REPEATS = 5     # repetitions per probe (statistical)
+    SGT_AUTOTUNE_MAX_ITERATIONS = 5    # safety cap
 
 
 class TMC5160Profile(TriggerProfile):
@@ -1476,7 +1518,15 @@ new Chart(document.getElementById('sgChart'), {
                         rj['sg']['median'] - rj_prev['sg']['median'])
 
             if len(sg_deltas) >= 3:
-                expected_delta = sum(sg_deltas) / len(sg_deltas)
+                # Use median (not mean) of prior deltas as the
+                # baseline. Median is robust against outliers like
+                # the saturation-region first delta — e.g. starting
+                # at flow=10 with a high SGT can produce a -418
+                # delta that poisons mean-based predictions for
+                # several steps and makes the natural saturation
+                # curve look like a "plateau" trigger.
+                sorted_deltas = sorted(sg_deltas)
+                expected_delta = sorted_deltas[len(sorted_deltas) // 2]
                 actual_delta = sg_med - results[-2]['sg']['median']
 
                 # Trend direction (+1 = SG rises with load, -1 = SG falls
@@ -1551,9 +1601,26 @@ new Chart(document.getElementById('sgChart'), {
                     # bisection mode reflect bisection bracket logic,
                     # not the smooth coarse sweep this trigger
                     # assumes.
+                    #
+                    # Also skip plateau if any prior coarse step had
+                    # SG values in the saturation region (close to
+                    # 1023). Saturation clipping artificially inflates
+                    # the prior delta — the SG-vs-load curve looks
+                    # MUCH steeper than reality, so the trigger then
+                    # interprets normal saturation behaviour later in
+                    # the sweep as a "stalled trend".
                     last_phase = results[-1].get('phase', 'coarse')
+                    prior_sg_max = max(
+                        results[j]['sg']['median']
+                        for j in range(max(0, len(results) - 5),
+                                       len(results) - 1)
+                        if results[j].get('sg'))
+                    saturation_skip = (
+                        prior_sg_max
+                        > self.profile.PLATEAU_SATURATION_SKIP)
                     if (expected_load > 5
-                            and last_phase == 'coarse'):
+                            and last_phase == 'coarse'
+                            and not saturation_skip):
                         prev_actual = (results[-2]['sg']['median']
                                        - results[-3]['sg']['median'])
                         cumulative_load = (actual_load
@@ -2357,6 +2424,273 @@ new Chart(document.getElementById('sgChart'), {
 
         return snapshot
 
+    # ─── Auto-SGT tuning ────────────────────────────────────────────
+
+    def _can_autotune_sgt(self):
+        """Return True if the current driver supports automatic SGT
+        tuning. Currently only signed-SGT (SG2) drivers are supported:
+        TMC5160, TMC2130, TMC2240. TMC2209 (SG4) and TMC2660 are
+        skipped — they have different field semantics.
+        """
+        if self.tmc is None:
+            return False
+        if self.is_2209:
+            return False  # SG4 with SGTHRS — not yet supported
+        # Verify the sgt field actually exists on this driver
+        try:
+            self.tmc.fields.get_field('sgt')
+            return True
+        except (KeyError, AttributeError):
+            return False
+
+    def _set_sgt(self, value):
+        """Set the SGT field via SET_TMC_FIELD. Returns True on success."""
+        try:
+            self.gcode.run_script_from_command(
+                "SET_TMC_FIELD STEPPER=%s FIELD=sgt VALUE=%d"
+                % (self.stepper_name, int(value)))
+            return True
+        except Exception as e:
+            logging.exception("tmc_flow_test: failed to set sgt: %s" % e)
+            return False
+
+    def _probe_sg_at_flow(self, gcmd, flow, duration, repeat):
+        """Run a multi-repeat extrusion at the given flow and return
+        SG statistics (median, p25, p75, cv). Used for the auto-SGT
+        tuning probe. Wraps _measure_step so we get the full statistical
+        treatment (warmup-skip, median, IQR, run-to-run CV) rather than
+        a noisy single-shot average.
+        Returns dict with 'median', 'cv', 'min', 'max' or None on failure.
+        """
+        # _measure_step does its own gcode run + sampling + warmup-skip
+        result = self._measure_step(gcmd, flow, duration, repeat,
+                                     skip_warmup=True)
+        if not result or not result.get('sg'):
+            return None
+        sg = result['sg']
+        rc = result.get('run_consistency') or {}
+        return {
+            'median': sg.get('median'),
+            'p25': sg.get('p25'),
+            'p75': sg.get('p75'),
+            'min': sg.get('min'),
+            'max': sg.get('max'),
+            'cv': rc.get('sg_cv', 0),
+            'warmup_dropped': result.get('warmup_dropped', False),
+        }
+
+    def _autotune_sgt(self, gcmd, start_flow):
+        """Pre-test SGT auto-tuning probe.
+
+        Runs short low-flow probes and adjusts SGT until SG_RESULT
+        sits in the profile's target range (SGT_LOW_TARGET_MIN .. MAX).
+        This guarantees the main test starts with adequate dynamic
+        range, which is the single biggest factor for accurate
+        slip detection.
+
+        Probe flow strategy: probes AT the user's START flow.
+        Reason: SGT effects on the SG-vs-load curve are flow-dependent.
+        If we probe at flow=5 but the test actually starts at flow=10,
+        the SGT we tune for flow=5 will produce a less-than-target SG
+        value at flow=10 — leaving the early test steps with too
+        little dynamic range, which makes the natural SG-vs-load
+        saturation curve look like a "plateau" trigger and produces
+        false-positive slip detections in the coarse phase.
+        Probing at start_flow makes the calibration directly
+        relevant to where the test begins.
+
+        SGT semantics (signed -64..+63):
+          higher SGT  →  less sensitive  →  higher SG_RESULT values
+          lower SGT   →  more sensitive  →  lower SG_RESULT values
+
+        On exit, the SGT register holds the tuned value. Returns
+        (original_sgt, final_sgt) so the caller can either restore the
+        original (recommended for safety) or keep the tuned value
+        for the test run. The console output recommends the tuned
+        value for permanent inclusion in printer.cfg.
+        """
+        if not self._can_autotune_sgt():
+            gcmd.respond_info(
+                "Auto-SGT skipped: driver doesn't support sgt field "
+                "tuning (TMC2209/SG4 not yet supported).")
+            return None, None
+
+        try:
+            original_sgt = self.tmc.fields.get_field('sgt')
+        except (KeyError, AttributeError):
+            gcmd.respond_info(
+                "Auto-SGT skipped: could not read current sgt value.")
+            return None, None
+
+        sgt_min = self.profile.SGT_RANGE_MIN
+        sgt_max = self.profile.SGT_RANGE_MAX
+        target_min = self.profile.SGT_LOW_TARGET_MIN
+        target_max = self.profile.SGT_LOW_TARGET_MAX
+        # Probe AT the user's START flow, not a fixed lower value.
+        # The reason: SGT calibration is flow-dependent. If we probe
+        # at flow=5 but the test starts at flow=10, the SGT we tuned
+        # for flow=5 will produce a smaller SG range at flow=10 than
+        # expected — leaving us in or near the target band ONLY at
+        # flow=5, and below it from flow=10 onwards. That triggers
+        # plateau false-positives later (the curve looks flat because
+        # SG has already collapsed to the lower end of the scale).
+        # Probing at start_flow guarantees the scale is calibrated
+        # for the load the test actually begins with.
+        probe_flow = start_flow
+        probe_duration = self.profile.SGT_AUTOTUNE_PROBE_DURATION
+        probe_repeats = self.profile.SGT_AUTOTUNE_PROBE_REPEATS
+        max_iter = self.profile.SGT_AUTOTUNE_MAX_ITERATIONS
+
+        gcmd.respond_info(
+            "===== Auto-SGT tuning =====\n"
+            "Probing SG_RESULT at %.1f mm³/s (%d reps × %.1f s)\n"
+            "Target range at low load: SG_RESULT %d-%d (median)\n"
+            "Current SGT: %d (range %d..%d)"
+            % (probe_flow, probe_repeats, probe_duration,
+               target_min, target_max,
+               original_sgt, sgt_min, sgt_max))
+
+        cur_sgt = original_sgt
+        history = []  # [(sgt, sg_median, cv), ...]
+
+        for iteration in range(max_iter):
+            stats = self._probe_sg_at_flow(gcmd, probe_flow,
+                                            probe_duration, probe_repeats)
+            if stats is None or stats.get('median') is None:
+                gcmd.respond_info(
+                    "  iteration %d: SGT=%d → no SG samples (skipping)"
+                    % (iteration + 1, cur_sgt))
+                break
+
+            sg_med = stats['median']
+            sg_cv = stats.get('cv', 0)
+            sg_max = stats.get('max', 0)
+            history.append((cur_sgt, sg_med, sg_cv))
+
+            # In-range check: median must be in target range AND no
+            # samples saturated. Saturation at probe-flow guarantees
+            # saturation at the test's actual start_flow (which is
+            # higher than probe), so we treat any 1023 samples as
+            # "SGT too high" even if the median looks acceptable.
+            saturated = sg_max >= 1023
+            in_range = (target_min <= sg_med <= target_max
+                        and not saturated)
+
+            if in_range:
+                status = "✓ in range"
+            elif saturated and target_min <= sg_med <= target_max:
+                status = "saturated samples — SGT too high"
+            else:
+                status = "needs adjustment"
+            sat_note = " [max=1023 saturated!]" if saturated else ""
+            gcmd.respond_info(
+                "  iteration %d: SGT=%d → SG median=%.0f, CV=%.1f%%, "
+                "max=%.0f (%s)%s"
+                % (iteration + 1, cur_sgt, sg_med, sg_cv, sg_max,
+                   status, sat_note))
+
+            if in_range:
+                break
+
+            # Decide adjustment direction. Saturation forces "lower SGT"
+            # regardless of median (the median is misleading if upper
+            # samples are clipped to 1023).
+            if saturated:
+                # Always lower SGT when samples saturated
+                step = 5 if sg_med > 1000 else 3
+                new_sgt = max(sgt_min, cur_sgt - step)
+            elif sg_med < target_min:
+                # Too sensitive — raise SGT
+                step = 5 if sg_med < target_min / 2 else 3
+                new_sgt = min(sgt_max, cur_sgt + step)
+            else:
+                # Above target_max but not saturated — lower SGT
+                step = 3
+                new_sgt = max(sgt_min, cur_sgt - step)
+
+            if new_sgt == cur_sgt:
+                gcmd.respond_info(
+                    "  Reached SGT bound (%d) without entering target "
+                    "range — stopping." % cur_sgt)
+                break
+
+            cur_sgt = new_sgt
+            if not self._set_sgt(cur_sgt):
+                gcmd.respond_info(
+                    "  Failed to write SGT=%d — aborting auto-tune."
+                    % cur_sgt)
+                cur_sgt = original_sgt
+                self._set_sgt(original_sgt)
+                break
+
+        else:
+            gcmd.respond_info(
+                "  Reached max iterations (%d) without entering target "
+                "range." % max_iter)
+
+        # Final report. The loop above uses (median in range AND not
+        # saturated) as the success condition — and breaks out of the
+        # loop on the first successful iteration. So if the loop
+        # exited on success, the LAST history entry is the in-range
+        # one. We use the same in-range definition here.
+        last_sg = history[-1][1] if history else None
+        final_sgt = cur_sgt
+        in_target = (last_sg is not None
+                     and target_min <= last_sg <= target_max)
+        if in_target:
+            if final_sgt != original_sgt:
+                gcmd.respond_info(
+                    "Auto-SGT: tuned to SGT=%d (was %d).\n"
+                    "→ For a permanent fix, add to your "
+                    "[%s extruder] section:\n"
+                    "    driver_SGT: %d\n"
+                    "Continuing test with tuned SGT..."
+                    % (final_sgt, original_sgt,
+                       self.driver_type, final_sgt))
+            else:
+                gcmd.respond_info(
+                    "Auto-SGT: current SGT=%d already optimal — "
+                    "no change needed."
+                    % original_sgt)
+        else:
+            gcmd.respond_info(
+                "Auto-SGT: could not reach target range. "
+                "Continuing with SGT=%d (last SG median=%s).\n"
+                "  → Consider manually tuning SGT and re-running."
+                % (final_sgt,
+                   "%.0f" % last_sg if last_sg is not None else "n/a"))
+
+        return original_sgt, final_sgt
+
+    def _restore_sgt_if_needed(self, gcmd, original_sgt, final_sgt,
+                                keep_sgt, announce=True):
+        """Restore SGT to its original value unless keep_sgt is set
+        or the auto-tune was a no-op. Safe to call multiple times."""
+        if (original_sgt is None
+                or final_sgt is None
+                or final_sgt == original_sgt):
+            return  # nothing to do
+        if keep_sgt:
+            if announce:
+                gcmd.respond_info(
+                    "Auto-SGT: KEEP_SGT=1 — leaving SGT=%d active "
+                    "until next FIRMWARE_RESTART." % final_sgt)
+            return
+        if self._set_sgt(original_sgt):
+            if announce:
+                gcmd.respond_info(
+                    "Auto-SGT: restored original SGT=%d "
+                    "(test ran with tuned SGT=%d). To make the "
+                    "tuned value permanent, add to your config:\n"
+                    "    driver_SGT: %d"
+                    % (original_sgt, final_sgt, final_sgt))
+        else:
+            if announce:
+                gcmd.respond_info(
+                    "Auto-SGT: WARNING failed to restore original "
+                    "SGT=%d. Run FIRMWARE_RESTART to reset."
+                    % original_sgt)
+
     # ─── Main commands ──────────────────────────────────────────────
 
     def cmd_TMC_FLOW_FIND_MAX(self, gcmd):
@@ -2383,6 +2717,8 @@ new Chart(document.getElementById('sgChart'), {
         no_html = gcmd.get_int('NO_HTML', 0, minval=0, maxval=1)
         skip_check = gcmd.get_int(
             'SKIP_TMC_CHECK', 0, minval=0, maxval=1)
+        auto_sgt = gcmd.get_int('AUTO_SGT', 1, minval=0, maxval=1)
+        keep_sgt = gcmd.get_int('KEEP_SGT', 0, minval=0, maxval=1)
 
         if min_step >= coarse_step:
             raise gcmd.error(
@@ -2421,6 +2757,27 @@ new Chart(document.getElementById('sgChart'), {
                 "Hotend not at target: %.1f°C (target %.1f°C). "
                 "Wait for M109 or run M109 S%d before testing."
                 % (cur_temp, target_temp, int(target_temp)))
+
+        # ─── Auto-SGT tuning ───
+        # Optional pre-test step that probes SG_RESULT at low flow
+        # and adjusts SGT to land in the profile's healthy target
+        # range. Set AUTO_SGT=0 to skip. By default the original
+        # SGT is RESTORED after the test so printer.cfg behavior
+        # doesn't silently change; pass KEEP_SGT=1 to leave the
+        # tuned value active until the next FIRMWARE_RESTART.
+        #
+        # IMPORTANT: _measure_step issues `G1 E<value>` commands which
+        # are interpreted in the current extruder mode. The main test
+        # (further below) sets `M83\nG92 E0` (relative + reset)
+        # before the coarse loop, but auto-SGT runs BEFORE that block,
+        # so we set the same mode here. Without this, only the first
+        # repetition extrudes anything — subsequent reps see "G1 E5"
+        # as "go TO position 5" and the extruder is already there.
+        original_sgt = None
+        final_sgt = None
+        if auto_sgt and self._can_autotune_sgt():
+            self.gcode.run_script_from_command("M83\nG92 E0")
+            original_sgt, final_sgt = self._autotune_sgt(gcmd, start_flow)
 
         rotation_distance = self._get_rotation_distance(extruder)
         if rotation_distance is None:
@@ -2545,6 +2902,8 @@ new Chart(document.getElementById('sgChart'), {
                 % max_flow)
             self._save_report(results, meta, timestamp, None,
                               no_html, gcmd=gcmd)
+            self._restore_sgt_if_needed(gcmd, original_sgt, final_sgt,
+                                         keep_sgt)
             return
 
         if low < start_flow:
@@ -2552,6 +2911,8 @@ new Chart(document.getElementById('sgChart'), {
                 "Trigger fired on first step (%.1f) — lower START." % high)
             self._save_report(results, meta, timestamp, first_trigger_reason,
                               no_html, gcmd=gcmd)
+            self._restore_sgt_if_needed(gcmd, original_sgt, final_sgt,
+                                         keep_sgt)
             return
 
         # ─── PHASES 2 + 3: Bisection + Verify (with retry) ───
@@ -2851,6 +3212,10 @@ new Chart(document.getElementById('sgChart'), {
                                   self._coarse_baseline_stats(results),
                           })
         self.gcode.run_script_from_command("G92 E0")
+
+        # Restore SGT (unless KEEP_SGT=1)
+        self._restore_sgt_if_needed(gcmd, original_sgt, final_sgt,
+                                     keep_sgt)
 
 
 def load_config(config):
