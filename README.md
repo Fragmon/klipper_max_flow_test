@@ -92,6 +92,7 @@ See [StallGuard tuning](#2-stallguard-tuning) below for the complete tuning work
 ## Requirements
 
 - Klipper or Kalico
+- hotend at print temperature
 - TMC stepper driver on the extruder with StallGuard support:
 
 | Driver  | StallGuard | Required chopper mode for the test       | Tested |
@@ -104,8 +105,6 @@ See [StallGuard tuning](#2-stallguard-tuning) below for the complete tuning work
 | TMC2208 / TMC2226 | — | (no StallGuard; not supported)         | not supported |
 
 **The TMC2240 is special**: it has both StallGuard4 AND StallGuard2 on-chip. The plugin works in either mode — see [the chopper mode section](#-important-chopper-mode-required-for-stallguard) below for details. SG2/SpreadCycle is the `klipper_tmc_autotune` default and the more practical choice for printing.
-
-- Hotend at print temperature
 
 ---
 
