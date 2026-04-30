@@ -232,13 +232,80 @@ class TMC2240Profile(TriggerProfile):
 
 
 class TMC2209Profile(TriggerProfile):
-    """TMC2209 — SG4 + StealthChop only.
+    """TMC2209 — SG4 in StealthChop or SpreadCycle.
 
-    Currently identical to the base profile — adjust based on real
-    TMC2209 test data when available.
+    Empirical findings on TMC2209 (Sherpa Mini, validated 2026-04-30):
+
+    Unlike the SG2 drivers (TMC5160 / TMC2240), TMC2209 SG4_RESULT
+    behaves very differently and the SG-median trigger logic that
+    works on SG2 does NOT apply:
+
+    1. SG_RESULT scale is 0-510 (not 0-1023). Trinamic spec says
+       "higher = lower load" same as SG2, but in practice SG_RESULT
+       on TMC2209 only produces meaningful values above a hardware-
+       specific minimum velocity — below that it sticks in a "bias
+       region" of 6-22 regardless of actual load.
+
+    2. SG-median MAGNITUDE is unreliable as a slip indicator. On
+       validated TMC2209 hardware, SG actually INCREASED with load
+       (from 6 at low flow to 86 at near-stall), the opposite of
+       what Trinamic's spec describes. This is why Klipper's
+       sensorless homing on TMC2209 only uses the binary DIAG-pin
+       trigger (SG < 2*SGTHRS), not the SG_RESULT magnitude itself.
+
+    3. SG run-to-run CV (variance) IS a reliable slip indicator.
+       At validated stall point (flow=140, motor physically slipped):
+         CV jumped from 2.4% (no slip) to 23.3% (full stall).
+       That's a 10x increase — easily detectable.
+
+    Strategy: trigger primarily on CV-spike and IQR-widening. Disable
+    SG-median-based triggers (snap-back, plateau, max-spike) since
+    they assume the SG2 "smooth load curve" model that doesn't apply.
     """
-    # SG4 has wider range (0-510) and higher jump magnitudes
-    SG_JUMP_THRESHOLD = 15
+    # ─── SG-median triggers DISABLED ──────────────────────────────
+    # Set thresholds extremely high so they never fire. SG2 logic
+    # (snap-back / plateau / max-spike) doesn't apply to SG4.
+    SG_JUMP_THRESHOLD = 99999       # disable sudden-jump trigger
+    SG_MAX_SPIKE_RATIO = 99.0       # disable max-spike (decoupling) trigger
+    SG_MAX_SPIKE_RATIO_BISECT = 99.0
+    PLATEAU_RATIO = 0.0             # 0 → never fire plateau
+    PLATEAU_SATURATION_SKIP = 0     # n/a since plateau disabled
+
+    # ─── CV-based triggers TIGHTENED ──────────────────────────────
+    # Empirically: CV ~2-7 % during clean operation, jumps to 20-30 %
+    # at slip. Set CV_HIGH_VARIANCE high enough to ignore noise but
+    # low enough to catch the slip jump.
+    CV_HIGH_VARIANCE = 12.0         # absolute CV trigger (vs 5.0 on SG2)
+    CV_JUMP_RATIO_BISECT = 3.0      # 3x baseline jump in bisection
+    CV_JUMP_RATIO_COARSE = 4.0      # 4x for coarse (noise-tolerant)
+    CV_RISING_BISECT = 8.0          # rising CV trend trigger
+    CV_RISING_COARSE = 12.0
+    CV_VS_COARSE_BISECT = 4.0       # 4x coarse-baseline CV
+    CV_VS_COARSE_COARSE = 6.0
+    CV_LOWBASE_RATIO = 5.0          # only trigger if base CV > 1 %
+    CV_FLOOR = 1.0
+
+    # ─── IQR-based triggers TIGHTENED ─────────────────────────────
+    # IQR also widens dramatically at slip. On the 0-510 scale the
+    # absolute IQR threshold needs to be lower than for SG2.
+    IQR_RATIO_COARSE = 5.0
+    IQR_RATIO_BISECT = 4.0
+    IQR_VS_COARSE_BISECT = 6.0
+    IQR_ABSOLUTE_TRIGGER = 50       # raw SG units (vs 25 on SG2)
+    REQUIRE_CV_CROSS_CHECK = True   # IQR alone needs CV confirmation
+
+    # ─── Border / sanity ──────────────────────────────────────────
+    BORDER_CV_LOW = 6.0             # CV between 6-12% = borderline
+    BORDER_CV_HIGH = 12.0
+    BORDER_IQR_LOW = 30
+    BORDER_IQR_HIGH = 50
+
+    # ─── Outlier detection (single-run slip in 5 reps) ────────────
+    OUTLIER_MAD_RATIO = 4.0
+    OUTLIER_MIN_REL = 0.15          # relaxed for SG4 noise (vs 0.08 on SG2)
+
+    # ─── Warmup-skip ──────────────────────────────────────────────
+    WARMUP_DRIFT_THRESHOLD = 0.15   # SG4 has higher first-run drift
 
 
 def get_trigger_profile(driver_type):
@@ -303,6 +370,13 @@ class TMCFlowTest:
         self.gcode.register_command(
             'TMC_FLOW_STATUS', self.cmd_TMC_FLOW_STATUS,
             desc='Show current TMC StallGuard diagnostic values')
+        self.gcode.register_command(
+            'TMC_FLOW_TEST_SG_VARIANTS',
+            self.cmd_TMC_FLOW_TEST_SG_VARIANTS,
+            desc='TMC2209-only diagnostic: probe SG_RESULT in both '
+                 'StealthChop and SpreadCycle to determine empirically '
+                 'which chopper mode produces a usable signal on this '
+                 'specific hardware')
 
     # ─── TMC driver lookup ──────────────────────────────────────────
 
@@ -730,9 +804,22 @@ class TMCFlowTest:
                 '<h2>Maximum Safe Volumetric Flow</h2>'
                 '<div class="big-number">%.1f<span class="unit">'
                 'mm³/s</span></div>'
+                '<p class="result-explainer">'
+                'This is the highest extrusion speed (in cubic millimeters '
+                'of plastic per second) where your motor still '
+                'reliably grips the filament. Beyond this point, the '
+                'extruder gear starts to slip on the filament — '
+                'producing under-extrusion, layer issues or print '
+                'failures.'
+                '</p>'
                 '<div class="quality-line">Verification quality: '
-                '<strong>%s</strong> (CV = %.1f%%)</div>'
+                '<strong>%s</strong> '
+                '<span class="quality-tooltip" title="How consistent the '
+                'measurement was across the 5 verify repetitions. Lower '
+                'CV = more consistent = more trust in the result.">'
+                '(CV = %.1f%%) ⓘ</span></div>'
                 '<div class="recommendations">'
+                '<h3>Use these values in your slicer</h3>'
                 '<div class="rec-table">'
                 '<span class="rec-label">Conservative (80%%)</span>'
                 '<span class="rec-value">%.1f mm³/s</span>'
@@ -741,6 +828,13 @@ class TMCFlowTest:
                 '<span class="rec-value">%.1f mm³/s</span>'
                 '<span class="rec-note">only with margin</span>'
                 '</div>'
+                '<p class="rec-explainer">'
+                'The 80%% value is what most people should use as their '
+                'slicer\'s "max volumetric speed" — it leaves headroom '
+                'for filament variability, temperature fluctuations and '
+                'long prints. The 90%% value is more aggressive and '
+                'should only be used after long-term print testing.'
+                '</p>'
                 '</div>'
                 '%s'
                 '</div>'
@@ -813,11 +907,15 @@ class TMCFlowTest:
                     '<div class="baseline-stats">'
                     '<h3>Healthy ranges (from %d coarse-phase steps)</h3>'
                     '<p class="baseline-explainer">'
-                    'These are the typical CV and IQR values during the '
-                    'slip-free portion of the test. Trigger thresholds '
-                    'are calibrated relative to these baselines: '
-                    '<strong>any value far outside this range was treated '
-                    'as evidence of slip</strong>.'
+                    'During the coarse sweep before slip started, the '
+                    'plugin saw consistent measurements — CV and IQR '
+                    'stayed in the ranges shown below. Once any later '
+                    'step jumped <strong>far outside</strong> these '
+                    '"healthy" ranges (e.g. CV doubling, IQR widening '
+                    'a lot), that was the plugin\'s signal that slip '
+                    'had started. Think of it like measuring a '
+                    'person\'s normal heart rate at rest — if it '
+                    'suddenly doubles, something\'s changed.'
                     '</p>'
                     '<table class="baseline-table">'
                     '<thead><tr><th>Metric</th><th>Min</th><th>Median</th>'
@@ -833,6 +931,11 @@ class TMCFlowTest:
                     '<td>≥ 18 AND ≥ 2.5× median, OR ≥ 25 absolute</td>'
                     '</tr>'
                     '</tbody></table>'
+                    '<p class="baseline-legend"><em>'
+                    'CV = how much the 5 repetitions of one step varied. '
+                    'IQR = how spread out the SG samples were within '
+                    'one step. Both are explained in the glossary above.'
+                    '</em></p>'
                     '</div>'
                     % (baseline_stats['n_steps'],
                        baseline_stats['cv_min'],
@@ -864,6 +967,16 @@ class TMCFlowTest:
             decision_trail_html = (
                 '<details class="decision-trail" open>'
                 '<summary>Why this value? — Decision trail</summary>'
+                '<p class="trail-intro">'
+                'This section shows <strong>exactly why</strong> the '
+                'plugin chose the final value. The "healthy ranges" '
+                'table tells you what normal CV/IQR looks like during '
+                'the slip-free portion of the test — the plugin '
+                'treats anything well outside those ranges as a slip '
+                'signal. The events table below lists every '
+                'decision moment in chronological order; the '
+                'bottom-most row is what produced the final result.'
+                '</p>'
                 '%s%s'
                 '</details>' % (baseline_block, events_block))
 
@@ -1064,6 +1177,112 @@ h1 { color: #1565c0; }
 table { width: 100%%; border-collapse: collapse; font-size: 13px; }
 th, td { padding: 8px 12px; border: 1px solid #ddd; text-align: right; }
 th { background: #f5f5f5; }
+
+/* ─── Layperson-friendly explanations ─── */
+.result-explainer {
+  margin: 16px 0 12px;
+  padding: 12px 16px;
+  background: rgba(255,255,255,0.7);
+  border-left: 4px solid #2c7a3e;
+  border-radius: 4px;
+  font-size: 0.95em;
+  line-height: 1.5;
+  color: #333;
+}
+.quality-tooltip {
+  cursor: help;
+  border-bottom: 1px dotted #888;
+  font-size: 0.9em;
+  color: #555;
+}
+.recommendations h3 {
+  margin: 18px 0 10px;
+  font-size: 1.05em;
+  color: #444;
+}
+.rec-explainer {
+  margin: 12px 0 4px;
+  padding: 10px 14px;
+  background: rgba(255,255,255,0.6);
+  border-left: 4px solid #888;
+  border-radius: 4px;
+  font-size: 0.88em;
+  line-height: 1.5;
+  color: #444;
+}
+details.glossary {
+  margin: 24px 0;
+  background: #fafbfc;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  padding: 12px 18px;
+}
+details.glossary > summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: #2c5a8e;
+  font-size: 1.05em;
+  padding: 6px 0;
+  list-style: none;
+}
+details.glossary > summary::-webkit-details-marker { display: none; }
+details.glossary > summary::before {
+  content: "▶ ";
+  display: inline-block;
+  margin-right: 6px;
+  transition: transform 0.2s;
+}
+details.glossary[open] > summary::before {
+  content: "▼ ";
+}
+.glossary-content {
+  margin-top: 12px;
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+}
+.glossary-item {
+  background: white;
+  border: 1px solid #eee;
+  border-radius: 6px;
+  padding: 12px 14px;
+}
+.glossary-item h4 {
+  margin: 0 0 6px;
+  font-size: 0.95em;
+  color: #2c5a8e;
+}
+.glossary-item p {
+  margin: 0;
+  font-size: 0.88em;
+  line-height: 1.5;
+  color: #444;
+}
+.chart-explainer {
+  margin: 6px 0 14px;
+  padding: 10px 14px;
+  background: #f8f9fa;
+  border-left: 4px solid #2c5a8e;
+  border-radius: 4px;
+  font-size: 0.9em;
+  line-height: 1.5;
+  color: #444;
+}
+.trail-intro {
+  margin: 10px 0 14px;
+  padding: 10px 14px;
+  background: #f8f9fa;
+  border-left: 4px solid #2c5a8e;
+  border-radius: 4px;
+  font-size: 0.9em;
+  line-height: 1.5;
+  color: #444;
+}
+.baseline-legend {
+  margin: 8px 0 0;
+  font-size: 0.82em;
+  color: #777;
+}
 </style></head><body>
 <h1>TMC Flow Test Results</h1>
 <p style="color:#666;margin-top:-10px;">
@@ -1074,12 +1293,106 @@ th { background: #f5f5f5; }
 <div class="meta">%(meta_html)s</div>
 %(tmc_settings_html)s
 %(summary_html)s
+
+<details class="glossary">
+<summary>What do these terms mean? — Click to learn</summary>
+<div class="glossary-content">
+
+<div class="glossary-item">
+<h4>Volumetric flow (mm³/s)</h4>
+<p>How much molten plastic your hotend can push out per second, measured
+in cubic millimeters. A V6-style hotend handles ~10–15 mm³/s; a Volcano
+~20–25; a CHT or high-flow nozzle 30+. The number depends on hotend
+melting capacity AND on your extruder motor's grip strength — this test
+measures the motor side.</p>
+</div>
+
+<div class="glossary-item">
+<h4>StallGuard / SG_RESULT</h4>
+<p>A signal from your TMC stepper driver that estimates how hard the
+motor is working. Values range 0–1023. <strong>High SG = motor running
+freely, low load. Low SG = motor under heavy load, close to slipping.</strong>
+The plugin watches this signal during extrusion.</p>
+</div>
+
+<div class="glossary-item">
+<h4>Run-to-run CV (coefficient of variation)</h4>
+<p>Each measurement step extrudes the same amount of filament 5 times
+in a row. CV measures how much those 5 results varied. <strong>Low CV
+(under 3%%) = consistent = motor is gripping reliably. High CV
+(over 5%%) = inconsistent = motor sometimes slips, sometimes grips —
+classic intermittent slip warning.</strong> A jump from 1%% baseline
+to 7%% is a strong slip indicator.</p>
+</div>
+
+<div class="glossary-item">
+<h4>IQR (P75 − P25, "interquartile range")</h4>
+<p>How spread out the SG samples were within a single measurement.
+Each step collects ~100 SG samples; IQR is the range that holds the
+middle 50%% of them. <strong>Small IQR = samples cluster tightly =
+clean signal. Large IQR = samples vary widely = motor was struggling
+with momentary load spikes.</strong></p>
+</div>
+
+<div class="glossary-item">
+<h4>Median vs. Mean (Average)</h4>
+<p>The plugin reports the <em>median</em> SG value (middle value when
+sorted), not the mean. Median is more robust against outliers — a
+single weird sample (e.g. a momentary 1023 spike) doesn't skew it.</p>
+</div>
+
+<div class="glossary-item">
+<h4>Coarse / Bisection / Verification</h4>
+<p>Three-phase search algorithm:
+<br><strong>Coarse</strong> = step up by 10 mm³/s until a slip
+indicator fires (rough overshoot, fast).
+<br><strong>Bisection</strong> = halve the gap between "safe" and
+"slip" repeatedly until accuracy is ±1 mm³/s.
+<br><strong>Verification</strong> = re-test the result with extra
+repetitions. If verify also detects slip, fall back to bisection
+with a tighter range.</p>
+</div>
+
+<div class="glossary-item">
+<h4>Trigger types</h4>
+<p>The plugin uses ~10 independent slip indicators. Any one firing
+ends the current phase:
+<br><strong>CV spike / jump</strong> — variance suddenly jumped vs.
+the calm coarse-phase baseline.
+<br><strong>IQR widening</strong> — SG samples no longer cluster
+tightly.
+<br><strong>SG max-spike</strong> — rare sample dramatically higher
+than median (motor briefly lost contact, "decoupling").
+<br><strong>Plateau</strong> — flow keeps increasing but SG stops
+falling proportionally (motor saturating its torque).
+<br><strong>Run outlier</strong> — one of 5 repetitions deviated
+strongly from the others (intermittent slip).</p>
+</div>
+
+<div class="glossary-item">
+<h4>Conservative 80%% vs. Aggressive 90%%</h4>
+<p>The "Maximum Safe" value is what the plugin found just below where
+slip starts. The 80%% recommendation gives you a 20%% safety buffer —
+recommended for everyday use because filament thickness varies, hotend
+temperature drifts, and longer prints stress the system more. The 90%%
+value is closer to the limit and should only be used after you've
+validated it with several long real-world prints.</p>
+</div>
+
+</div>
+</details>
+
 %(decision_trail_html)s
 
 <div class="chart-container">
   <h2>%(sg_label)s vs. Flow Rate</h2>
-  <p>Lower SG = higher mechanical load. Median is the robust statistic;
-     IQR (P25-P75) shows sample spread.</p>
+  <p class="chart-explainer">
+    The <strong>line</strong> shows the median SG value at each tested
+    flow rate. The <strong>shaded band</strong> shows where most samples
+    sat (P25–P75 range). <strong>Lower line = motor under more load.</strong>
+    A smooth curve means clean, predictable behavior. Sudden jumps,
+    spikes upward, or wide bands indicate slip is starting.
+  </p>
   <canvas id="sgChart"></canvas>
 </div>
 
@@ -2454,17 +2767,25 @@ new Chart(document.getElementById('sgChart'), {
             logging.exception("tmc_flow_test: failed to set sgt: %s" % e)
             return False
 
-    def _probe_sg_at_flow(self, gcmd, flow, duration, repeat):
+    def _probe_sg_at_flow(self, gcmd, flow, duration, repeat,
+                           skip_warmup=True):
         """Run a multi-repeat extrusion at the given flow and return
         SG statistics (median, p25, p75, cv). Used for the auto-SGT
         tuning probe. Wraps _measure_step so we get the full statistical
         treatment (warmup-skip, median, IQR, run-to-run CV) rather than
         a noisy single-shot average.
+
+        skip_warmup: if True (default), the first repetition is
+        excluded if it deviates from the rest. Set to False for
+        diagnostic measurements where you want the unfiltered raw
+        signal — useful when the SG signal itself is degenerate (e.g.
+        TMC2209 SG4 producing only a few discrete values).
+
         Returns dict with 'median', 'cv', 'min', 'max' or None on failure.
         """
         # _measure_step does its own gcode run + sampling + warmup-skip
         result = self._measure_step(gcmd, flow, duration, repeat,
-                                     skip_warmup=True)
+                                     skip_warmup=skip_warmup)
         if not result or not result.get('sg'):
             return None
         sg = result['sg']
@@ -2690,6 +3011,417 @@ new Chart(document.getElementById('sgChart'), {
                     "Auto-SGT: WARNING failed to restore original "
                     "SGT=%d. Run FIRMWARE_RESTART to reset."
                     % original_sgt)
+
+    # ─── TMC_FLOW_TEST_SG_VARIANTS ─────────────────────────────────
+    # Diagnostic for TMC2209 only. Trinamic states StallGuard4 is
+    # "intended for StealthChop mode, only" but doesn't categorically
+    # state it returns nothing in SpreadCycle. Different production
+    # batches and motor combinations give wildly different behaviour
+    # in SpreadCycle. This command runs the same probe in BOTH chopper
+    # modes and tells the user empirically what their hardware does.
+    #
+    # Why this matters: TMC2209 in SpreadCycle delivers ~50 % more
+    # peak torque than in StealthChop, so if a particular hardware
+    # combo happens to produce a usable SG signal in SpreadCycle, the
+    # user could get significantly higher max-flow results.
+
+    def _save_tmc2209_chopper_state(self):
+        """Snapshot TMC2209 chopper-mode-relevant fields for restore.
+
+        TMC2209 uses different field names than TMC5160:
+          - TMC2209 GCONF Bit 2 = 'en_spreadcycle' (1=SpreadCycle, 0=StealthChop)
+          - TMC5160 GCONF Bit 2 = 'en_pwm_mode'    (1=StealthChop, 0=SpreadCycle)
+        Note the inverted semantics! This method is TMC2209-only.
+
+        Returns dict with 'en_spreadcycle', 'tpwmthrs', 'sgthrs',
+        'tcoolthrs' (or None values where read failed).
+        """
+        snapshot = {}
+        for field in ('en_spreadcycle', 'tpwmthrs',
+                       'sgthrs', 'tcoolthrs'):
+            try:
+                snapshot[field] = self.tmc.fields.get_field(field)
+            except (KeyError, AttributeError):
+                snapshot[field] = None
+        return snapshot
+
+    def _set_tmc_field_safe(self, field, value):
+        """SET_TMC_FIELD wrapper. Returns True on success."""
+        try:
+            self.gcode.run_script_from_command(
+                "SET_TMC_FIELD STEPPER=%s FIELD=%s VALUE=%d"
+                % (self.stepper_name, field, int(value)))
+            return True
+        except Exception as e:
+            logging.exception(
+                "tmc_flow_test: failed to set %s: %s" % (field, e))
+            return False
+
+    def _restore_tmc2209_chopper(self, snapshot, gcmd):
+        """Restore the chopper state captured by snapshot. Best-effort:
+        logs failures but tries to set every field that has a value."""
+        ok = True
+        for field in ('en_spreadcycle', 'tpwmthrs',
+                       'sgthrs', 'tcoolthrs'):
+            if snapshot.get(field) is not None:
+                if not self._set_tmc_field_safe(field, snapshot[field]):
+                    ok = False
+        if ok:
+            gcmd.respond_info(
+                "Original chopper config restored.")
+        else:
+            gcmd.respond_info(
+                "WARNING: chopper restore had failures. Run "
+                "FIRMWARE_RESTART to fully reset.")
+        return ok
+
+    def _evaluate_sg4_quality(self, low_stats, high_stats):
+        """Decide if a (low-flow, high-flow) pair of probes shows a
+        usable SG4 signal for slip detection.
+
+        IMPORTANT: SG4 on TMC2209 behaves differently from SG2. The
+        original SG2 logic (load drops SG_RESULT proportionally) does
+        NOT apply. Empirically, SG_RESULT on TMC2209:
+          - Sticks in a "bias region" (6-22) at low velocity
+          - Often INCREASES (not decreases) with load
+          - But CV (run-to-run variance) reliably EXPLODES at slip
+
+        Validated behaviour at physical stall (flow=140, motor slipped):
+          flow=30:  SG=6,   CV=2.4%  (clean operation, low velocity)
+          flow=140: SG=118, CV=23.3% (physical slip — CV jumped 10x)
+
+        Strategy: declare the signal "usable" if EITHER:
+          (a) CV difference is large enough that a CV-spike trigger
+              would catch slip (CV ratio ≥ 3x), OR
+          (b) SG-median moves by enough magnitude in EITHER direction
+              that a magnitude-based trigger could work (|delta| ≥ 50)
+
+        We accept either direction of SG-median change because some
+        TMC2209 hardware shows the inverted behaviour (SG up at load).
+        The plugin's CV/IQR-based triggers work regardless of SG
+        direction.
+
+        Returns dict with 'usable' (bool), 'reason' (str), 'delta'
+        (signed median difference high - low), 'cv_ratio' (high_cv /
+        low_cv).
+        """
+        if not low_stats or not high_stats:
+            return {'usable': False,
+                    'reason': 'one or both probes returned no samples',
+                    'delta': None, 'cv_ratio': None}
+
+        low_med = low_stats.get('median', 0)
+        high_med = high_stats.get('median', 0)
+        low_cv = low_stats.get('cv', 100)
+        high_cv = high_stats.get('cv', 100)
+        delta = high_med - low_med
+        # Avoid division by zero for very small CV
+        cv_ratio = high_cv / max(low_cv, 0.5)
+
+        # Both probes returning zero means no signal at all
+        if low_med == 0 and high_med == 0:
+            return {'usable': False,
+                    'reason': 'SG_RESULT stuck at 0 in both probes — '
+                              'driver returns no SG signal',
+                    'delta': delta, 'cv_ratio': cv_ratio}
+
+        # Path A: CV-spike between low and high flow → slip-detection
+        # would work via CV-based triggers (the primary mechanism on
+        # TMC2209)
+        if cv_ratio >= 3.0 and high_cv >= 10.0:
+            return {'usable': True,
+                    'reason': ('CV-spike detected: CV jumped from '
+                               '%.1f%% (low) to %.1f%% (high), %.1fx '
+                               'increase. The CV-based slip triggers '
+                               'will catch real slip events.'
+                               % (low_cv, high_cv, cv_ratio)),
+                    'delta': delta, 'cv_ratio': cv_ratio}
+
+        # Path B: large SG-median magnitude change (in either direction)
+        # → magnitude-based triggers might also work as a backup
+        if abs(delta) >= 50:
+            direction = ('drops' if delta < 0 else 'rises')
+            return {'usable': True,
+                    'reason': ('SG-median %s by %d units between low '
+                               'and high flow. Signal is responsive to '
+                               'load (note: TMC2209 SG direction can be '
+                               'inverted vs. SG2 spec — this is normal).'
+                               % (direction, abs(delta))),
+                    'delta': delta, 'cv_ratio': cv_ratio}
+
+        # Neither CV nor SG-median moved enough — signal is dead
+        if low_cv > 25 or high_cv > 25:
+            return {'usable': False,
+                    'reason': ('high noise without load-correlated '
+                               'change: CV %.1f%% / %.1f%%, SG delta '
+                               'only %d. Pure noise, not signal.'
+                               % (low_cv, high_cv, delta)),
+                    'delta': delta, 'cv_ratio': cv_ratio}
+        return {'usable': False,
+                'reason': ('signal too flat: SG delta = %+d, CV ratio '
+                           '%.1fx (need either |delta| ≥ 50 OR CV '
+                           'ratio ≥ 3x with high_cv ≥ 10%%). Try '
+                           'higher HIGH_FLOW or higher run_current.'
+                           % (delta, cv_ratio)),
+                'delta': delta, 'cv_ratio': cv_ratio}
+
+    def cmd_TMC_FLOW_TEST_SG_VARIANTS(self, gcmd):
+        """Empirically probe whether TMC2209 SG4 produces usable
+        readings in SpreadCycle mode (in addition to the documented
+        StealthChop mode).
+
+        Test method:
+          1. Save current chopper state
+          2. Force StealthChop, probe SG at LOW_FLOW and HIGH_FLOW
+          3. Force SpreadCycle, probe SG at LOW_FLOW and HIGH_FLOW
+          4. Compare: usable signal needs (a) non-zero median, (b)
+             load-sensitive Δmedian ≥ 30, (c) run-to-run CV < 25 %
+          5. Restore original chopper state
+          6. Print verdict and recommendation
+        """
+        self._lookup_tmc()
+        if self.driver_type != 'tmc2209':
+            gcmd.respond_info(
+                "TMC_FLOW_TEST_SG_VARIANTS is only meaningful for "
+                "TMC2209 (current driver: %s). For TMC5160/TMC2240 "
+                "the plugin already runs in the optimal SG2 + "
+                "SpreadCycle mode." % self.driver_type)
+            return
+
+        low_flow = gcmd.get_float('LOW_FLOW', 5.0,
+                                   minval=1.0, maxval=30.0)
+        high_flow = gcmd.get_float('HIGH_FLOW', 20.0,
+                                    minval=5.0, maxval=150.0)
+        duration = gcmd.get_float('DURATION', 5.0,
+                                   minval=2.0, maxval=15.0)
+        repeat = gcmd.get_int('REPEAT', 5, minval=3, maxval=10)
+        sgthrs = gcmd.get_int('SGTHRS', 100, minval=0, maxval=255)
+
+        if high_flow <= low_flow:
+            raise gcmd.error(
+                "HIGH_FLOW (%.1f) must be greater than LOW_FLOW (%.1f)"
+                % (high_flow, low_flow))
+
+        # Hotend-temp safety check — same pattern as the main test
+        extruder = self.printer.lookup_object('extruder')
+        heater = extruder.get_heater()
+        cur_temp, _ = heater.get_temp(self.reactor.monotonic())
+        target_temp = heater.target_temp
+        if cur_temp < self.min_hotend_temp:
+            raise gcmd.error(
+                "Hotend too cold: %.1f °C < %.1f °C minimum"
+                % (cur_temp, self.min_hotend_temp))
+
+        gcmd.respond_info(
+            "===== TMC2209 SG_RESULT chopper-mode comparison =====\n"
+            "This test will run %d × %.1f s probes at flow=%.1f mm³/s\n"
+            "and flow=%.1f mm³/s in BOTH StealthChop and SpreadCycle.\n"
+            "It empirically determines whether SG_RESULT works in\n"
+            "SpreadCycle on YOUR specific hardware.\n"
+            "Expected runtime: ~%.0f minutes.\n"
+            "Hotend: %.1f °C / target %.1f °C\n"
+            "------------------------------------------------"
+            % (repeat, duration, low_flow, high_flow,
+               (4 * repeat * (duration + 0.5)) / 60.0,
+               cur_temp, target_temp))
+
+        # Snapshot current chopper config
+        snapshot = self._save_tmc2209_chopper_state()
+        gcmd.respond_info(
+            "Saved chopper state: en_spreadcycle=%s tpwmthrs=%s "
+            "sgthrs=%s tcoolthrs=%s"
+            % (snapshot['en_spreadcycle'], snapshot['tpwmthrs'],
+               snapshot['sgthrs'], snapshot['tcoolthrs']))
+
+        # Set extruder relative + zero
+        self.gcode.run_script_from_command("M83\nG92 E0\nM400")
+        # Ensure SGTHRS is a sane value for the test (irrelevant for
+        # SG_RESULT reads themselves, but needed if user has it at 0)
+        self._set_tmc_field_safe('sgthrs', sgthrs)
+        # TCOOLTHRS must be > 0 for SG to be active (Trinamic spec).
+        # Use 0xFFFFF (= 1048575, max 20-bit value) so SG is active
+        # at any motor velocity.
+        self._set_tmc_field_safe('tcoolthrs', 0xFFFFF)
+        # Sync to ensure the fields are committed before we proceed
+        self.gcode.run_script_from_command("M400")
+
+        results = {}
+        try:
+            # ─── Phase A: StealthChop ──────────────────────────────
+            # TMC2209 GCONF Bit 2 'en_spreadcycle':
+            #   0 = StealthChop (Trinamic default for TMC2209)
+            #   1 = SpreadCycle
+            # TPWMTHRS = 0xFFFFF means "never auto-switch to SpreadCycle
+            # at higher velocity" — we want pure StealthChop here.
+            gcmd.respond_info(">>> Phase A: StealthChop (documented)")
+            self._set_tmc_field_safe('en_spreadcycle', 0)
+            self._set_tmc_field_safe('tpwmthrs', 0xFFFFF)
+            # Settle delay + sync. Re-assert M83 + G92 E0 because some
+            # SET_TMC_FIELD operations can disturb the extruder state
+            # (or Klipper may reset it as part of the field write).
+            self.gcode.run_script_from_command(
+                "M400\nG4 P1500\nM83\nG92 E0\nM400")
+
+            gcmd.respond_info(
+                "  StealthChop: low-flow probe at %.1f mm³/s..." % low_flow)
+            sc_low = self._probe_sg_at_flow(
+                gcmd, low_flow, duration, repeat, skip_warmup=False)
+            # Reset extruder state between probes too — the rep-loop
+            # in _measure_step relies on M83 still being active.
+            self.gcode.run_script_from_command(
+                "M400\nG4 P2000\nM83\nG92 E0\nM400")
+            gcmd.respond_info(
+                "  StealthChop: high-flow probe at %.1f mm³/s..." % high_flow)
+            sc_high = self._probe_sg_at_flow(
+                gcmd, high_flow, duration, repeat, skip_warmup=False)
+
+            results['stealthchop'] = {
+                'low': sc_low, 'high': sc_high,
+                'eval': self._evaluate_sg4_quality(sc_low, sc_high),
+            }
+            # Inter-phase rest
+            self.gcode.run_script_from_command(
+                "M400\nG4 P3000\nM83\nG92 E0\nM400")
+
+            # ─── Phase B: SpreadCycle ──────────────────────────────
+            # Force SpreadCycle by setting en_spreadcycle=1.
+            # TPWMTHRS irrelevant when en_spreadcycle=1 since GCONF
+            # already forces SpreadCycle.
+            gcmd.respond_info(">>> Phase B: SpreadCycle (experimental)")
+            self._set_tmc_field_safe('en_spreadcycle', 1)
+            self._set_tmc_field_safe('tpwmthrs', 0)
+            self.gcode.run_script_from_command(
+                "M400\nG4 P1500\nM83\nG92 E0\nM400")
+
+            gcmd.respond_info(
+                "  SpreadCycle: low-flow probe at %.1f mm³/s..." % low_flow)
+            sp_low = self._probe_sg_at_flow(
+                gcmd, low_flow, duration, repeat, skip_warmup=False)
+            self.gcode.run_script_from_command(
+                "M400\nG4 P2000\nM83\nG92 E0\nM400")
+            gcmd.respond_info(
+                "  SpreadCycle: high-flow probe at %.1f mm³/s..." % high_flow)
+            sp_high = self._probe_sg_at_flow(
+                gcmd, high_flow, duration, repeat, skip_warmup=False)
+
+            results['spreadcycle'] = {
+                'low': sp_low, 'high': sp_high,
+                'eval': self._evaluate_sg4_quality(sp_low, sp_high),
+            }
+        finally:
+            # ─── Always restore original chopper state ─────────────
+            self._restore_tmc2209_chopper(snapshot, gcmd)
+
+        # ─── Report ────────────────────────────────────────────────
+        def fmt_probe(p):
+            if not p or p.get('median') is None:
+                return "no samples"
+            return ("median=%.0f, p25=%.0f, p75=%.0f, min=%.0f, max=%.0f, "
+                    "CV=%.1f%%"
+                    % (p.get('median', 0), p.get('p25', 0),
+                       p.get('p75', 0), p.get('min', 0),
+                       p.get('max', 0), p.get('cv', 0)))
+
+        gcmd.respond_info(
+            "================================================\n"
+            "===== Results =====")
+
+        for mode_name, mode_label in [('stealthchop', 'StealthChop'),
+                                      ('spreadcycle', 'SpreadCycle')]:
+            data = results.get(mode_name, {})
+            ev = data.get('eval', {})
+            usable = ev.get('usable', False)
+            verdict = "✓ USABLE" if usable else "✗ NOT USABLE"
+            gcmd.respond_info(
+                "%s: %s\n"
+                "  flow=%.1f mm³/s: %s\n"
+                "  flow=%.1f mm³/s: %s\n"
+                "  → %s"
+                % (mode_label, verdict, low_flow,
+                   fmt_probe(data.get('low')),
+                   high_flow,
+                   fmt_probe(data.get('high')),
+                   ev.get('reason', 'no evaluation')))
+
+        # ─── Recommendation ────────────────────────────────────────
+        sc_eval = results['stealthchop']['eval']
+        sp_eval = results['spreadcycle']['eval']
+        sc_ok = sc_eval.get('usable', False)
+        sp_ok = sp_eval.get('usable', False)
+
+        gcmd.respond_info("===== Recommendation =====")
+        if sc_ok and sp_ok:
+            sc_cvr = sc_eval.get('cv_ratio') or 0
+            sp_cvr = sp_eval.get('cv_ratio') or 0
+            # Both work — pick the one with cleaner slip signature
+            if sp_cvr > sc_cvr * 1.2:
+                gcmd.respond_info(
+                    "✓ Both StealthChop AND SpreadCycle produce a\n"
+                    "  usable slip signal on YOUR hardware.\n"
+                    "  SpreadCycle has stronger CV-spike at slip\n"
+                    "  (CV ratio %.1fx vs %.1fx in StealthChop).\n"
+                    "  → SpreadCycle gives full motor torque AND a\n"
+                    "    detectable slip signal — use it for max flow:\n"
+                    "      stealthchop_threshold: 0\n"
+                    "      driver_SGTHRS: %d\n"
+                    "  → Run TMC_FLOW_FIND_MAX MAX=150 START=30\n"
+                    "  → CAUTION: SG4 in SpreadCycle is unsupported by\n"
+                    "    Trinamic spec. Validate with several long\n"
+                    "    prints before trusting the slicer value."
+                    % (sp_cvr, sc_cvr, sgthrs))
+            else:
+                gcmd.respond_info(
+                    "✓ Both StealthChop AND SpreadCycle produce a\n"
+                    "  usable slip signal on YOUR hardware.\n"
+                    "  StealthChop has stronger or similar CV-spike\n"
+                    "  (CV ratio %.1fx vs %.1fx).\n"
+                    "  → Use the documented StealthChop mode:\n"
+                    "      stealthchop_threshold: 999999\n"
+                    "      driver_SGTHRS: %d\n"
+                    "  → Run TMC_FLOW_FIND_MAX MAX=150 START=30"
+                    % (sc_cvr, sp_cvr, sgthrs))
+        elif sc_ok:
+            gcmd.respond_info(
+                "✓ StealthChop produces a usable slip signal on\n"
+                "  YOUR hardware (CV ratio %.1fx between low/high flow).\n"
+                "✗ SpreadCycle did not show a clean slip signature.\n"
+                "  → Use the documented StealthChop config:\n"
+                "      stealthchop_threshold: 999999\n"
+                "      driver_SGTHRS: %d\n"
+                "  → Run TMC_FLOW_FIND_MAX MAX=150 START=30\n"
+                "    (START=30 because TMC2209 SG4 has a low-velocity\n"
+                "    bias region — start above it for clean readings)"
+                % (sc_eval.get('cv_ratio') or 0, sgthrs))
+        elif sp_ok:
+            gcmd.respond_info(
+                "✓ SpreadCycle produces a usable slip signal on YOUR\n"
+                "  hardware (CV ratio %.1fx between low/high flow).\n"
+                "✗ StealthChop did not show a clean slip signature.\n"
+                "  → This is unusual but the test confirms SpreadCycle\n"
+                "    works for slip detection here.\n"
+                "  → Force SpreadCycle in your config:\n"
+                "      stealthchop_threshold: 0\n"
+                "      driver_SGTHRS: %d\n"
+                "  → Run TMC_FLOW_FIND_MAX MAX=150 START=30\n"
+                "  → CAUTION: SG4 in SpreadCycle is unsupported per\n"
+                "    Trinamic spec. Validate before relying on result."
+                % (sp_eval.get('cv_ratio') or 0, sgthrs))
+        else:
+            gcmd.respond_info(
+                "✗ Neither chopper mode produced a usable slip signal\n"
+                "  on this hardware combination.\n"
+                "  Diagnostics to try:\n"
+                "  1. Was the motor actually slipping at HIGH_FLOW?\n"
+                "     If not, increase HIGH_FLOW (try 150) so the\n"
+                "     test reaches actual stall.\n"
+                "  2. Increase run_current (e.g. 1.0 A) for more\n"
+                "     load differentiation.\n"
+                "  3. Check with DUMP_TMC STEPPER=extruder during a\n"
+                "     long G1 E... command — does SG_RESULT change?\n"
+                "  4. If SG_RESULT stays at 0 or one fixed value:\n"
+                "     hardware-side SG4 problem (some TMC2209 clones\n"
+                "     have non-functional SG4). Try a different\n"
+                "     TMC2209 board, or switch to TMC2240.")
 
     # ─── Main commands ──────────────────────────────────────────────
 
