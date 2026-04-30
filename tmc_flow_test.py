@@ -19,6 +19,197 @@ MODULE_VERSION = "3.0"
 SG_MIN_INFORMATIVE = 50   # below this SG value, readings are noise
 
 
+# ─── Driver-specific trigger profiles ──────────────────────────────────
+# Each TMC chip family has its own SG noise characteristics, scale, and
+# CoolStep behaviour. Rather than embedding "if self.sg2_driver / else"
+# branches throughout the trigger code, all tunable thresholds are
+# centralized here in a profile per driver. To adjust sensitivity for
+# one driver family without affecting the others, edit only its profile.
+#
+# The base profile contains the values that have been validated against
+# real TMC5160 test runs (CSVs from 11-37, 12-40, 12-56, 13-20). Other
+# drivers START as identical copies and can be tuned independently from
+# real data.
+
+class TriggerProfile:
+    """Threshold values used by the slip-detection triggers.
+
+    Inherit and override only the fields that need tuning for a
+    specific driver family. Values here are the validated TMC5160
+    defaults — DO NOT change them without re-running the TMC5160
+    regression suite.
+    """
+
+    # ─── _check_cv_spike thresholds ────────────────────────────────
+    # Pattern (a) "high-variance trip" — last CV above this absolute
+    # value triggers immediately, regardless of baseline.
+    CV_HIGH_VARIANCE = 10.0
+
+    # Pattern (b) "ratio jump from immediate baseline"
+    CV_JUMP_RATIO_COARSE = 2.5
+    CV_JUMP_RATIO_BISECT = 2.0
+    CV_JUMP_MIN_COARSE = 5.0
+    CV_JUMP_MIN_BISECT = 4.0
+
+    # Pattern (c) "rising trend" — three consecutive ≥1.3× steps
+    CV_RISING_RATIO = 1.3
+    CV_RISING_MIN_PRIOR = 2.5
+    CV_RISING_MIN_LAST_COARSE = 5.0
+    CV_RISING_MIN_LAST_BISECT = 4.0
+
+    # Pattern (d) "vs coarse-phase baseline" (bisection only)
+    CV_VS_COARSE_RATIO = 2.0
+    CV_VS_COARSE_MIN = 5.0
+
+    # Single-step low-baseline jump check
+    CV_LOWBASE_RATIO = 1.5
+
+    # ─── _check_iqr_spread thresholds ──────────────────────────────
+    # Pattern (a) "ratio vs immediate prior steps"
+    IQR_RATIO_COARSE = 3.0
+    IQR_RATIO_BISECT = 1.7
+    IQR_RATIO_MIN_ABS = 12   # don't fire on tiny absolute IQRs
+    # Pattern (a) CV cross-check: when True, pattern (a) only fires
+    # if CV ALSO confirms elevated noise relative to prior steps.
+    # Helps drivers (e.g. SG4 with active CoolStep) where CS regulation
+    # widens within-step IQR without affecting run-to-run reproducibility
+    # (CV stays low). TMC5160 was validated with this OFF — leave it
+    # off for SG2 unless real data shows false positives there too.
+    IQR_RATIO_REQUIRE_CV = False
+    IQR_RATIO_CV_FLOOR_COARSE = 3.0   # absolute CV floor, coarse phase
+    IQR_RATIO_CV_FLOOR_BISECT = 2.5   # absolute CV floor, bisection
+
+    # Pattern (b) "vs coarse-phase median"
+    IQR_VS_COARSE_RATIO = 2.5
+    IQR_VS_COARSE_MIN_ABS = 18
+    IQR_VS_COARSE_REQUIRE_CV = True   # CV cross-check on by default
+    IQR_VS_COARSE_CV_FLOOR = 3.0
+    IQR_VS_COARSE_CV_RATIO = 1.5
+
+    # Pattern (c) "absolute" — trigger if IQR ≥ this in bisection
+    IQR_ABSOLUTE_TRIGGER = 25
+
+    # ─── _check_sg_max_spike thresholds ────────────────────────────
+    SG_MAX_RATIO_TO_MEDIAN = 3.0
+    SG_MAX_RATIO_TO_COARSE = 1.3
+    SG_MAX_ABS_GAP = 200            # absolute gap floor (sg2_driver)
+    SG_MAX_ABS_GAP_SG4 = 150        # absolute gap floor (sg4 chips)
+    SG_MAX_BIG_RATIO = 4.0          # alt path — extreme ratio
+    SG_MAX_BIG_GAP = 300            # alt path — extreme gap
+    # Inverse direction (rare case where SG rises with load)
+    SG_MIN_RATIO_TO_MEDIAN = 3.0
+    SG_MIN_ABS_GAP = 80
+
+    # ─── _check_run_outlier thresholds ─────────────────────────────
+    OUTLIER_MAD_RATIO = 4.0         # deviation ≥ this × MAD
+    OUTLIER_MIN_REL = 0.08          # AND ≥ 8 % of median
+
+    # ─── _is_borderline thresholds ─────────────────────────────────
+    BORDER_CV_LOW = 4.0
+    BORDER_CV_HIGH = 7.0
+    BORDER_CV_RATIO = 1.5
+    BORDER_IQR_LOW = 15
+    BORDER_IQR_HIGH = 25
+    BORDER_IQR_RATIO = 1.7
+    BORDER_IQR_CV_FLOOR = 2.0       # CV must be at least this for IQR-only borderline
+
+    # ─── SG-level / step-jump basics ───────────────────────────────
+    # Used by _sg_min_informative and _sg_jump_threshold.
+    # Note: sg2_driver returns -1 (no gating) for SG_MIN_INFORMATIVE,
+    # while SG4 returns the SG_MIN_INFORMATIVE module constant.
+    SG_JUMP_THRESHOLD = 5           # SG2: small jumps significant
+
+    # ─── Plateau trigger threshold ─────────────────────────────────
+    # The plateau trigger fires when the cumulative SG-load over 2
+    # steps falls short of expected_2step × this fraction. Lower
+    # values (e.g. 0.3) mean the trigger is more permissive — only
+    # really flat sections fire. Higher values (e.g. 0.6) mean any
+    # mild deceleration of the SG decline fires.
+    #
+    # TMC5160 baseline of 0.5 was tuned with real Sherpa data. TMC2240
+    # SG2 has a steeper SG-vs-load saturation curve (each delta is
+    # half the previous), so 0.5 fires very early on the natural
+    # saturation slope. Lower this fraction for TMC2240.
+    PLATEAU_RATIO = 0.5             # cumulative-load < this × expected_2step
+
+    # ─── Warmup-skip threshold ─────────────────────────────────────
+    # Per-step, the first repetition often shows different SG behaviour
+    # than the others (motor transitions from cold-stop to extruding,
+    # filament path settles, etc.). If run 1's SG average deviates from
+    # the rest by MORE than this fraction, it's flagged as warmup and
+    # excluded from the median/IQR/CV stats. The TMC5160 baseline
+    # (10 %) was tuned with real Sherpa Mini data; TMC2240 needs a
+    # more aggressive threshold because its run-to-run drift is
+    # systematically higher (typically 3-6 %) — without dropping
+    # warmup, the run-outlier trigger fires repeatedly on these
+    # warmup runs and aborts the test far below real slip.
+    WARMUP_DRIFT_THRESHOLD = 0.10   # 10 % default (TMC5160 baseline)
+
+
+class TMC5160Profile(TriggerProfile):
+    """TMC5160 / TMC2130 / TMC2660 — SG2 + SpreadCycle.
+
+    These are the validated production values. Do not change without
+    running the regression suite against the historical CSVs.
+    """
+    pass  # uses base defaults (= validated 5160 values)
+
+
+class TMC2240Profile(TriggerProfile):
+    """TMC2240 — SG2 + SpreadCycle (high-torque path).
+
+    The plugin runs TMC2240 in the same SG2/SpreadCycle path as the
+    TMC5160, because the SG4/StealthChop path delivers ~50 % less peak
+    torque (confirmed empirically: same Sherpa Mini reaches 110 mm³/s
+    on TMC5160 SG2 but only 60 mm³/s on TMC2240 SG4).
+
+    The TMC2240 SG2 hardware path produces nearly identical SG signal
+    characteristics to the TMC5160 — but with one systematic
+    difference: the first repetition of every measurement step shows
+    a 3-6 % SG drift compared to runs 2-5. This warmup pattern is
+    consistent across all flow steps (confirmed with CSV 21-02-45).
+    The default TMC5160 warmup-skip threshold (10 %) doesn't catch
+    these drifts in the coarse phase but does catch them in
+    bisection / verify, where the run-outlier trigger then
+    erroneously interprets the warmup run as slip — producing a
+    max-flow result that's roughly half the real hardware capability.
+
+    Fix: lower the warmup-skip threshold so run 1 is reliably
+    excluded throughout the test. All other thresholds inherit from
+    the validated TMC5160 baseline.
+
+    Second fix: lower the plateau-trigger threshold. The TMC2240 SG2
+    saturation curve is steeper than the TMC5160 — observed ratios
+    of 0.23 between consecutive deltas during natural saturation. The
+    TMC5160 default of 0.5 fires far too early on this curve. Setting
+    PLATEAU_RATIO to 0.2 makes the trigger fire only when the trend
+    truly flattens (which is when slip actually begins).
+    """
+    WARMUP_DRIFT_THRESHOLD = 0.04   # 4 % — catches the systematic drift
+    PLATEAU_RATIO = 0.2             # steeper saturation than TMC5160
+
+
+class TMC2209Profile(TriggerProfile):
+    """TMC2209 — SG4 + StealthChop only.
+
+    Currently identical to the base profile — adjust based on real
+    TMC2209 test data when available.
+    """
+    # SG4 has wider range (0-510) and higher jump magnitudes
+    SG_JUMP_THRESHOLD = 15
+
+
+def get_trigger_profile(driver_type):
+    """Return the appropriate TriggerProfile subclass for a given driver."""
+    if driver_type == 'tmc2240':
+        return TMC2240Profile
+    if driver_type == 'tmc2209':
+        return TMC2209Profile
+    # Default: TMC5160-style SG2 profile (covers tmc5160, tmc2130, tmc2660,
+    # and any unknown driver — safest fallback).
+    return TMC5160Profile
+
+
 class TMCFlowTest:
     def __init__(self, config):
         self.printer = config.get_printer()
@@ -51,34 +242,25 @@ class TMCFlowTest:
         # SG_RESULT in DRV_STATUS bits 0-9, threshold field 'sgt' (signed).
         self.sg2_driver = False
         self.sg4_available = False  # SG4_RESULT register (TMC2240)
+        # Trigger threshold profile — replaced in _lookup_tmc with the
+        # driver-appropriate subclass. Default = TMC5160 (validated).
+        self.profile = TMC5160Profile
 
         # Sample buffers
         self.samples_sg = []
-        self.samples_cs = []      # only used in CS mode
         self.samples_time = []
         self.sampling_active = False
         self.sample_timer = None
         self.sample_start_time = 0.0
 
-        # Track which mode we're in for trigger logic
-        self._mode = 'sg'         # 'sg' or 'cs'
-
-        # Main command — auto-detects mode from driver_SEMIN
+        # Main command
         self.gcode.register_command(
             'TMC_FLOW_FIND_MAX', self.cmd_TMC_FLOW_FIND_MAX,
-            desc='Find max volumetric flow rate. Auto-detects test mode '
-                 'from driver_SEMIN (CoolStep enabled or disabled)')
-        # Legacy / explicit mode commands (still work for existing macros)
-        self.gcode.register_command(
-            'TMC_FLOW_FIND_MAX_SG', self.cmd_TMC_FLOW_FIND_MAX_SG,
-            desc='Force SG-only mode (for setups with CoolStep disabled)')
-        self.gcode.register_command(
-            'TMC_FLOW_FIND_MAX_CS', self.cmd_TMC_FLOW_FIND_MAX_CS,
-            desc='Force CoolStep + StallGuard mode '
-                 '(for setups with CoolStep enabled)')
+            desc='Find max volumetric flow rate via StallGuard slip '
+                 'detection (Coarse → Bisection → Verification)')
         self.gcode.register_command(
             'TMC_FLOW_STATUS', self.cmd_TMC_FLOW_STATUS,
-            desc='Show current TMC StallGuard / CoolStep diagnostic values')
+            desc='Show current TMC StallGuard diagnostic values')
 
     # ─── TMC driver lookup ──────────────────────────────────────────
 
@@ -96,7 +278,19 @@ class TMCFlowTest:
                 self.is_2240 = (drv == 'tmc2240')
                 self.is_2209 = (drv == 'tmc2209')
                 self.is_5160 = (drv == 'tmc5160')
-                self.sg2_driver = drv in ('tmc5160', 'tmc2130', 'tmc2660')
+                # TMC2240 is treated as an SG2 driver (SpreadCycle path).
+                # Its SG4/StealthChop path delivers significantly less
+                # torque at high speeds — confirmed empirically: the same
+                # Sherpa Mini extruder reaches ~110 mm³/s on TMC5160 SG2
+                # but only ~60 mm³/s on TMC2240 SG4. Since this plugin
+                # exists to find MAX flow, we always use the high-torque
+                # SG2 path on TMC2240.
+                self.sg2_driver = drv in ('tmc5160', 'tmc2130',
+                                          'tmc2660', 'tmc2240')
+                # Pick the trigger threshold profile for this driver
+                # family. Each profile is independently tunable; the
+                # TMC5160 profile is the validated baseline.
+                self.profile = get_trigger_profile(drv)
                 # Check for SG4_RESULT register (TMC2240 only)
                 try:
                     self.sg4_available = (
@@ -106,9 +300,10 @@ class TMCFlowTest:
                     self.sg4_available = False
                 logging.info(
                     "tmc_flow_test: using %s for stepper '%s' "
-                    "(SG4=%s, is_2209=%s, sg2=%s)",
+                    "(SG4=%s, is_2209=%s, sg2=%s, profile=%s)",
                     drv, self.stepper_name, self.sg4_available,
-                    self.is_2209, self.sg2_driver)
+                    self.is_2209, self.sg2_driver,
+                    self.profile.__name__)
                 return
         raise self.gcode.error(
             "tmc_flow_test: no TMC driver found for stepper '%s'."
@@ -117,28 +312,30 @@ class TMCFlowTest:
     # ─── Driver-specific field accessors ────────────────────────────
 
     def _get_sg_threshold_field_name(self):
-        """Return the correct SG-threshold field name for this driver."""
-        if self.is_2240:
-            return 'sg4_thrs'
+        """Return the correct SG-threshold field name for this driver.
+
+        TMC5160 / TMC2130 / TMC2660 / TMC2240 (SG2 path) use 'sgt'.
+        TMC2209 uses 'sgthrs'.
+        """
         if self.sg2_driver:
-            # TMC5160 / TMC2130 / TMC2660 — StallGuard2 threshold (signed)
+            # TMC5160 / TMC2130 / TMC2660 / TMC2240 — StallGuard2 threshold
+            # (signed -64..63)
             return 'sgt'
         # TMC2209, TMC2226, TMC2208 use 'sgthrs'
         return 'sgthrs'
 
     def _get_sg_label(self):
-        """Human-readable label for the SG signal."""
-        if self.is_2240:
-            return 'SG4_RESULT'
+        """Human-readable label for the SG signal.
+
+        TMC2240 in SG2 mode uses SG_RESULT in DRV_STATUS just like the
+        TMC5160 — the SG4_RESULT register is unused on the SG2 path.
+        """
         return 'SG_RESULT'
 
     # ─── TMC config validation ──────────────────────────────────────
 
-    def _check_tmc_config(self, mode):
-        """Verify TMC driver is configured correctly for the requested mode.
-
-        mode: 'sg' (CoolStep should be OFF: SEMIN=0)
-              'cs' (CoolStep should be ON: SEMIN > 0)
+    def _check_tmc_config(self):
+        """Verify TMC driver is configured correctly for the SG-based test.
 
         Returns (problems, infos).
         """
@@ -162,21 +359,16 @@ class TMCFlowTest:
         sg_thrs_val = get(sg_thrs_field)
 
         # ─── Chopper-mode check (driver-specific) ───
-        # SG4 family (TMC2240, TMC2209): StallGuard4 needs StealthChop ON
-        # SG2 family (TMC5160, TMC2130, TMC2660): StallGuard2 needs SpreadCycle
-        if self.is_2240 or self.is_2209:
+        # SG4 family (TMC2209 only now): StallGuard4 needs StealthChop ON
+        # SG2 family (TMC5160, TMC2130, TMC2660, TMC2240):
+        #   StallGuard2 needs SpreadCycle
+        if self.is_2209:
             stealthchop_active = True
             stealthchop_indicator = None
-            if self.is_2240:
-                if en_pwm_mode is not None:
-                    stealthchop_active = (en_pwm_mode == 1)
-                    stealthchop_indicator = (
-                        'en_pwm_mode', en_pwm_mode, 'should be 1')
-            elif self.is_2209:
-                if en_spread_cycle is not None:
-                    stealthchop_active = (en_spread_cycle == 0)
-                    stealthchop_indicator = (
-                        'en_spreadCycle', en_spread_cycle, 'should be 0')
+            if en_spread_cycle is not None:
+                stealthchop_active = (en_spread_cycle == 0)
+                stealthchop_indicator = (
+                    'en_spreadCycle', en_spread_cycle, 'should be 0')
 
             if not stealthchop_active and stealthchop_indicator:
                 problems.append(
@@ -197,7 +389,7 @@ class TMCFlowTest:
                      'Set:\n'
                      '  stealthchop_threshold: 999999' % tpwmthrs))
         elif self.sg2_driver:
-            # TMC5160 / TMC2130 / TMC2660 — SG2 requires SpreadCycle.
+            # TMC5160 / TMC2130 / TMC2660 / TMC2240 — SG2 requires SpreadCycle.
             #
             # Klipper's tmc.py writes tpwmthrs = 0xFFFFF (= 1048575) as the
             # default when stealthchop_threshold is NOT set in the config —
@@ -212,6 +404,16 @@ class TMCFlowTest:
             #     the Klipper default → not a problem.
             stealthchop_default_tpwmthrs = 0xFFFFF  # 1048575
             if en_pwm_mode is not None and en_pwm_mode == 1:
+                # Build TMC2240-specific advice if applicable
+                if self.is_2240:
+                    extra = (
+                        '\nNote: this plugin uses TMC2240 in '
+                        'SG2/SpreadCycle mode for max torque (~50 %% '
+                        'higher peak flow than SG4/StealthChop). If you '
+                        'use sensorless homing, set the chopper mode '
+                        'temporarily for the test only.')
+                else:
+                    extra = ''
                 if (tpwmthrs is not None and 0 < tpwmthrs
                         < stealthchop_default_tpwmthrs):
                     problems.append(
@@ -220,9 +422,9 @@ class TMCFlowTest:
                          'but tpwmthrs=%d enables StealthChop below that '
                          'velocity.\n'
                          'Remove stealthchop_threshold from your [%s '
-                         'extruder] section (or set it to 0).'
+                         'extruder] section (or set it to 0).%s'
                          % (self.driver_type.upper(), tpwmthrs,
-                            self.driver_type)))
+                            self.driver_type, extra)))
                 else:
                     problems.append(
                         ('en_pwm_mode', en_pwm_mode,
@@ -230,8 +432,9 @@ class TMCFlowTest:
                          'in SpreadCycle mode.\n'
                          'Remove stealthchop_threshold from your [%s '
                          'extruder] section (do not set it to 0 — remove '
-                         'the line).'
-                         % (self.driver_type.upper(), self.driver_type)))
+                         'the line).%s'
+                         % (self.driver_type.upper(), self.driver_type,
+                            extra)))
             # else: en_pwm_mode == 0 → SpreadCycle is active. tpwmthrs is
             # irrelevant in this case (the driver never enters StealthChop),
             # whether it's 0 or 0xFFFFF.
@@ -245,62 +448,33 @@ class TMCFlowTest:
                  '  coolstep_threshold: 0.5' % self.driver_type))
 
         # ─── SG threshold check ───
-        # Only enforced for SG4 family. For SG2 (TMC5160/2130/2660), sgt is
-        # signed (-64..63) and SG_RESULT can be read regardless of sgt; we
-        # don't depend on the hardware stop trigger.
-        if (self.is_2240 or self.is_2209) and sg_thrs_val == 0:
+        # Only enforced for TMC2209 (SG4 path). For SG2 drivers
+        # (TMC5160/2130/2660/2240), sgt is signed (-64..63) and
+        # SG_RESULT can be read regardless of sgt; we don't depend on
+        # the hardware stop trigger.
+        if self.is_2209 and sg_thrs_val == 0:
             problems.append(
                 (sg_thrs_field, sg_thrs_val,
-                 '%s is 0. StallGuard trigger inactive.\n'
-                 'Add to printer.cfg:\n'
-                 '  [delayed_gcode setup_extruder_sg]\n'
-                 '  initial_duration: 2.0\n'
-                 '  gcode:\n'
-                 '      SET_TMC_FIELD STEPPER=%s FIELD=%s VALUE=%d'
-                 % (sg_thrs_field, self.stepper_name,
-                    sg_thrs_field,
-                    80 if self.is_2240 else 100)))
+                 'SGTHRS is 0. StallGuard trigger inactive.\n'
+                 'Add to your [tmc2209 extruder] section:\n'
+                 '  driver_SGTHRS: 100'))
 
-        # ─── Mode-specific CoolStep check ───
-        if mode == 'sg':
-            # SG-only mode requires CoolStep off for SG-only triggers to apply
-            if semin is not None and semin != 0:
-                problems.append(
-                    ('semin', semin,
-                     'SG-only mode is meant for setups with CoolStep '
-                     'disabled, but driver_SEMIN = %d.\n'
-                     'Easiest fix: just run TMC_FLOW_FIND_MAX (without _SG)\n'
-                     '— it auto-selects the right mode for your config.\n'
-                     'Or change your [%s extruder] section to driver_SEMIN: 0\n'
-                     'if you want to test in SG-only mode.'
-                     % (semin, self.driver_type)))
-            else:
-                infos.append(
-                    "SG-only mode: CoolStep is disabled (driver_SEMIN=0). "
-                    "Motor runs at constant IRUN. Test will use SG-based "
-                    "triggers only.")
-        elif mode == 'cs':
-            # CS mode requires CoolStep on for CS-based triggers to fire
-            if semin == 0:
-                problems.append(
-                    ('semin', semin,
-                     'CoolStep mode is meant for setups with CoolStep '
-                     'enabled, but driver_SEMIN = 0.\n'
-                     'Easiest fix: just run TMC_FLOW_FIND_MAX (without _CS)\n'
-                     '— it auto-selects the right mode for your config.\n'
-                     'Or change your [%s extruder] section to enable CoolStep:\n'
-                     '  driver_SEMIN: 5\n'
-                     '  driver_SEMAX: 2\n'
-                     '  driver_SEUP: 2\n'
-                     '  driver_SEDN: 1\n'
-                     '  driver_SEIMIN: 1\n'
-                     'if you want to test in CoolStep mode.'
-                     % self.driver_type))
-            else:
-                infos.append(
-                    "CoolStep mode: CoolStep is active (driver_SEMIN=%d). "
-                    "Motor current adapts to load. Test will use CS-based "
-                    "triggers with SG fallback." % semin)
+        # ─── CoolStep informational check ───
+        # The plugin runs SG-only triggers. CoolStep can still be enabled
+        # in the user's config (it doesn't break the test) but it may
+        # dampen SG signal during high-load steps and produce a less
+        # conservative max-flow result.
+        if semin is not None and semin > 0:
+            infos.append(
+                "Note: CoolStep is active (driver_SEMIN=%d). The test "
+                "will run with your configured SEMIN, but CoolStep may "
+                "dampen SG signal during high-load steps. For the most "
+                "conservative max-flow result, set driver_SEMIN: 0 "
+                "temporarily." % semin)
+        else:
+            infos.append(
+                "CoolStep is disabled (driver_SEMIN=0). Motor runs at "
+                "constant IRUN — recommended for clean SG signal.")
 
         # Driver info
         if self.is_2209:
@@ -308,8 +482,10 @@ class TMCFlowTest:
                 "Driver: TMC2209 detected (uses SG_RESULT, sgthrs).")
         elif self.is_2240:
             infos.append(
-                "Driver: TMC2240 detected (uses SG4_RESULT, sg4_thrs, "
-                "sg4_filt_en).")
+                "Driver: TMC2240 detected — using SG2/SpreadCycle path "
+                "(SG_RESULT via DRV_STATUS, sgt threshold) for max "
+                "torque. SG4/StealthChop path is intentionally bypassed "
+                "since it delivers ~50%% less peak flow.")
         elif self.sg2_driver:
             infos.append(
                 "Driver: %s detected (StallGuard2 in SpreadCycle, "
@@ -323,27 +499,27 @@ class TMCFlowTest:
     def _read_sg(self):
         """Read StallGuard value directly from the driver register.
 
-        TMC2240: SG4_RESULT register
-        TMC2209: SG_RESULT register
-        TMC5160 / TMC2130 / TMC2660: DRV_STATUS bits 0-9 (SG_RESULT)
+        TMC2209: SG_RESULT register (dedicated SG4 register)
+        TMC5160 / TMC2130 / TMC2660 / TMC2240 (SG2 path):
+            DRV_STATUS bits 0-9 (sg_result field)
         Other drivers: fallback via get_status()
-        """
-        reg_name = None
-        if self.is_2240:
-            reg_name = 'SG4_RESULT'
-        elif self.is_2209:
-            reg_name = 'SG_RESULT'
 
-        if reg_name is not None:
+        Note: TMC2240 has a separate SG4_RESULT register which we
+        deliberately ignore — we run TMC2240 in SpreadCycle/SG2 mode
+        for max torque, and SG2 lives in DRV_STATUS just like TMC5160.
+        """
+        # TMC2209 has its own SG_RESULT register (SG4)
+        if self.is_2209:
             try:
-                reg_val = self.tmc.mcu_tmc.get_register(reg_name)
-                return reg_val & 0x3FF  # lower 10 bits
+                reg_val = self.tmc.mcu_tmc.get_register('SG_RESULT')
+                return reg_val & 0x3FF
             except Exception as e:
                 logging.debug(
-                    "tmc_flow_test: %s read failed: %s", reg_name, e)
+                    "tmc_flow_test: SG_RESULT read failed: %s", e)
                 return None
 
-        # TMC5160 / TMC2130 / TMC2660: SG_RESULT lives in DRV_STATUS bits 0-9
+        # SG2 family (TMC5160 / TMC2130 / TMC2660 / TMC2240):
+        # SG_RESULT is in DRV_STATUS bits 0-9
         if self.sg2_driver:
             try:
                 reg_val = self.tmc.mcu_tmc.get_register('DRV_STATUS')
@@ -362,34 +538,9 @@ class TMCFlowTest:
         except Exception:
             return None
 
-    def _read_cs(self):
-        """Read CS_ACTUAL directly from DRV_STATUS register.
-
-        Bits 16-20 of DRV_STATUS = CS_ACTUAL (5 bits, range 0-31).
-        Same layout on TMC2240, TMC2209, TMC5160 / TMC2130 / TMC2660.
-        """
-        if self.is_2240 or self.is_2209 or self.sg2_driver:
-            try:
-                reg_val = self.tmc.mcu_tmc.get_register('DRV_STATUS')
-                return (reg_val >> 16) & 0x1F
-            except Exception as e:
-                logging.debug(
-                    "tmc_flow_test: DRV_STATUS read failed: %s", e)
-                return None
-        # Fallback for other drivers
-        try:
-            drv = self.tmc.get_status(self.reactor.monotonic())
-            if 'drv_status' in drv and isinstance(drv['drv_status'], dict):
-                return drv['drv_status'].get('cs_actual')
-            return drv.get('cs_actual')
-        except Exception:
-            return None
-
-    def _start_sampling(self, sample_cs=False):
+    def _start_sampling(self):
         self.samples_sg = []
-        self.samples_cs = []
         self.samples_time = []
-        self._sample_cs_flag = sample_cs
         self.sample_start_time = self.reactor.monotonic()
         self.sampling_active = True
         self.sample_timer = self.reactor.register_timer(
@@ -409,15 +560,11 @@ class TMCFlowTest:
         # For drivers we read directly from registers, accept any non-None
         # value (including 0). For fallback drivers via get_status, we
         # filter 0/None as those usually mean "not yet polled".
-        direct_read = self.is_2240 or self.is_2209 or self.sg2_driver
+        direct_read = self.is_2209 or self.sg2_driver
         if sg is not None:
             if direct_read or sg > 0:
                 self.samples_sg.append(sg)
                 self.samples_time.append(rel_t)
-                if self._sample_cs_flag:
-                    cs = self._read_cs()
-                    if cs is not None:
-                        self.samples_cs.append(cs)
         return eventtime + SAMPLE_INTERVAL
 
     # ─── Statistics ─────────────────────────────────────────────────
@@ -450,10 +597,9 @@ class TMCFlowTest:
 
     # ─── CSV / HTML output ──────────────────────────────────────────
 
-    def _write_csv(self, path, results, meta, mode):
+    def _write_csv(self, path, results, meta):
         with open(path, 'w') as f:
-            f.write("# TMC Flow Test v%s results (mode: %s)\n"
-                    % (MODULE_VERSION, mode))
+            f.write("# TMC Flow Test v%s results\n" % MODULE_VERSION)
             f.write("# Plugin by Steven (Fragmon) — Crydteam\n")
             f.write("# YouTube: https://www.youtube.com/@crydteamprinting\n")
             tmc_settings = None
@@ -469,22 +615,15 @@ class TMCFlowTest:
                 for label, value, raw in tmc_settings:
                     f.write("#   %s = %s  [%s]\n" % (label, value, raw))
 
-            # CSV header depends on mode
-            if mode == 'cs':
-                f.write("phase,flow_mm3s,sg_median,sg_p25,sg_p75,sg_avg,"
-                        "sg_min,sg_max,sg_n,cs_median,cs_p25,cs_p75,cs_avg,"
-                        "n_repeats,sg_run_cv_pct,run_sg_avgs,run_cs_avgs\n")
-            else:
-                f.write("phase,flow_mm3s,sg_median,sg_p25,sg_p75,sg_avg,"
-                        "sg_min,sg_max,sg_n,n_repeats,sg_run_cv_pct,"
-                        "run_sg_avgs\n")
+            # CSV header
+            f.write("phase,flow_mm3s,sg_median,sg_p25,sg_p75,sg_avg,"
+                    "sg_min,sg_max,sg_n,n_repeats,sg_run_cv_pct,"
+                    "run_sg_avgs\n")
 
             for r in results:
                 sg = r.get('sg') or {}
-                cs = r.get('cs') or {}
                 rc = r.get('run_consistency') or {}
                 run_sg = r.get('run_sg_avgs') or []
-                run_cs = r.get('run_cs_avgs') or []
                 phase = r.get('phase', 'coarse')
 
                 def fmt(d, key):
@@ -493,35 +632,19 @@ class TMCFlowTest:
                         return "%.1f" % v
                     return str(v)
 
-                if mode == 'cs':
-                    f.write("%s,%.2f,%s,%s,%s,%s,%s,%s,%s,"
-                            "%s,%s,%s,%s,%d,%s,%s,%s\n" % (
-                        phase,
-                        r['flow'],
-                        fmt(sg, 'median'), fmt(sg, 'p25'), fmt(sg, 'p75'),
-                        fmt(sg, 'avg'), sg.get('min', ''), sg.get('max', ''),
-                        sg.get('n', 0),
-                        fmt(cs, 'median'), fmt(cs, 'p25'), fmt(cs, 'p75'),
-                        fmt(cs, 'avg'),
-                        len(run_sg),
-                        "%.1f" % rc.get('sg_cv', 0) if rc else '',
-                        '|'.join("%.1f" % v for v in run_sg),
-                        '|'.join("%.1f" % v for v in run_cs),
-                    ))
-                else:
-                    f.write("%s,%.2f,%s,%s,%s,%s,%s,%s,%s,"
-                            "%d,%s,%s\n" % (
-                        phase,
-                        r['flow'],
-                        fmt(sg, 'median'), fmt(sg, 'p25'), fmt(sg, 'p75'),
-                        fmt(sg, 'avg'), sg.get('min', ''), sg.get('max', ''),
-                        sg.get('n', 0),
-                        len(run_sg),
-                        "%.1f" % rc.get('sg_cv', 0) if rc else '',
-                        '|'.join("%.1f" % v for v in run_sg),
-                    ))
+                f.write("%s,%.2f,%s,%s,%s,%s,%s,%s,%s,"
+                        "%d,%s,%s\n" % (
+                    phase,
+                    r['flow'],
+                    fmt(sg, 'median'), fmt(sg, 'p25'), fmt(sg, 'p75'),
+                    fmt(sg, 'avg'), sg.get('min', ''), sg.get('max', ''),
+                    sg.get('n', 0),
+                    len(run_sg),
+                    "%.1f" % rc.get('sg_cv', 0) if rc else '',
+                    '|'.join("%.1f" % v for v in run_sg),
+                ))
 
-    def _write_html(self, path, results, meta, limit_reason, mode,
+    def _write_html(self, path, results, meta, limit_reason,
                     final_result=None):
         """Compact HTML report with chart.
 
@@ -545,33 +668,6 @@ class TMCFlowTest:
         sg_p25 = [r['sg']['p25'] if r['sg'] else None for r in results]
         sg_p75 = [r['sg']['p75'] if r['sg'] else None for r in results]
         sg_avg = [r['sg']['avg'] if r['sg'] else None for r in results]
-
-        cs_chart_html = ""
-        cs_chart_script = ""
-        if mode == 'cs':
-            cs_median = [r['cs']['median'] if r.get('cs') else None
-                         for r in results]
-            cs_chart_html = """
-<div class="chart-container">
-  <h2>CS_ACTUAL vs. Flow Rate</h2>
-  <p>CoolStep current scale (0-31). Higher = more current applied.
-     Drops indicate motor needs less torque (or has lost load entirely).</p>
-  <canvas id="csChart"></canvas>
-</div>
-"""
-            cs_chart_script = """
-const csMedian = %s;
-new Chart(document.getElementById('csChart'), {
-    type: 'line',
-    data: { labels: flows,
-        datasets: [{ label: 'CS_ACTUAL median', data: csMedian,
-                     borderColor: '#d32f2f', fill: false, borderWidth: 2,
-                     pointRadius: 4 }] },
-    options: { ...commonOptions, scales: { ...commonOptions.scales,
-        y: { title: { display: true, text: 'CS_ACTUAL (0-31)' },
-             min: 0, max: 32 } } },
-});
-""" % json.dumps(cs_median)
 
         if final_result is not None:
             max_safe = final_result.get('max_safe')
@@ -763,7 +859,6 @@ new Chart(document.getElementById('csChart'), {
         rows = []
         for r in results:
             sg = r.get('sg') or {}
-            cs = r.get('cs') or {}
             rc = r.get('run_consistency') or {}
             cv_str = ''
             cv_class = ''
@@ -781,36 +876,19 @@ new Chart(document.getElementById('csChart'), {
                     return '-'
                 return fs % v
 
-            if mode == 'cs':
-                rows.append(
-                    "<tr><td>%.1f</td><td><b>%s</b></td>"
-                    "<td>%s</td><td>%s</td><td><b>%s</b></td>"
-                    "<td>%d</td><td%s>%s</td></tr>" % (
-                        r['flow'], fmt(sg, 'median'),
-                        fmt(sg, 'p25'), fmt(sg, 'p75'),
-                        fmt(cs, 'median'), sg.get('n', 0),
-                        cv_class, cv_str or '-'))
-            else:
-                rows.append(
-                    "<tr><td>%.1f</td><td><b>%s</b></td>"
-                    "<td>%s</td><td>%s</td><td>%s</td>"
-                    "<td>%d</td><td%s>%s</td></tr>" % (
-                        r['flow'], fmt(sg, 'median'),
-                        fmt(sg, 'p25'), fmt(sg, 'p75'), fmt(sg, 'avg'),
-                        sg.get('n', 0), cv_class, cv_str or '-'))
+            rows.append(
+                "<tr><td>%.1f</td><td><b>%s</b></td>"
+                "<td>%s</td><td>%s</td><td>%s</td>"
+                "<td>%d</td><td%s>%s</td></tr>" % (
+                    r['flow'], fmt(sg, 'median'),
+                    fmt(sg, 'p25'), fmt(sg, 'p75'), fmt(sg, 'avg'),
+                    sg.get('n', 0), cv_class, cv_str or '-'))
 
-        if mode == 'cs':
-            table_header = (
-                "<th>Flow (mm³/s)</th><th>%s median</th>"
-                "<th>%s P25</th><th>%s P75</th><th>CS median</th>"
-                "<th>n</th><th>Inter-run CV</th>"
-                % (sg_label, sg_label, sg_label))
-        else:
-            table_header = (
-                "<th>Flow (mm³/s)</th><th>%s median</th>"
-                "<th>%s P25</th><th>%s P75</th><th>%s avg</th>"
-                "<th>n</th><th>Inter-run CV</th>"
-                % (sg_label, sg_label, sg_label, sg_label))
+        table_header = (
+            "<th>Flow (mm³/s)</th><th>%s median</th>"
+            "<th>%s P25</th><th>%s P75</th><th>%s avg</th>"
+            "<th>n</th><th>Inter-run CV</th>"
+            % (sg_label, sg_label, sg_label, sg_label))
 
         table = ("<table><thead><tr>" + table_header
                  + "</tr></thead><tbody>"
@@ -818,7 +896,7 @@ new Chart(document.getElementById('csChart'), {
 
         html = """<!DOCTYPE html>
 <html><head><meta charset="UTF-8">
-<title>TMC Flow Test (%(mode)s) - %(timestamp)s</title>
+<title>TMC Flow Test - %(timestamp)s</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1"></script>
 <style>
@@ -945,7 +1023,7 @@ table { width: 100%%; border-collapse: collapse; font-size: 13px; }
 th, td { padding: 8px 12px; border: 1px solid #ddd; text-align: right; }
 th { background: #f5f5f5; }
 </style></head><body>
-<h1>TMC Flow Test Results — %(mode_upper)s mode</h1>
+<h1>TMC Flow Test Results</h1>
 <p style="color:#666;margin-top:-10px;">
   Plugin by Steven (Fragmon) — Crydteam ·
   <a href="https://www.youtube.com/@crydteamprinting"
@@ -963,7 +1041,6 @@ th { background: #f5f5f5; }
   <canvas id="sgChart"></canvas>
 </div>
 
-%(cs_chart_html)s
 
 <div class="chart-container">
   <h2>Data Table</h2>
@@ -1147,7 +1224,6 @@ new Chart(document.getElementById('sgChart'), {
         y: { title: { display: true,
              text: '%(sg_label)s (0-510)' } } } },
 });
-%(cs_chart_script)s
 </script>
 </body></html>"""
         # Build trigger-event annotations for the chart. We attach
@@ -1196,16 +1272,12 @@ new Chart(document.getElementById('sgChart'), {
         rendered = html % {
             'timestamp': meta.get('timestamp', '-'),
             'version': MODULE_VERSION,
-            'mode': mode,
-            'mode_upper': mode.upper(),
             'meta_html': meta_html,
             'tmc_settings_html': tmc_settings_html,
             'decision_trail_html': decision_trail_html,
             'summary_html': summary_html,
             'sg_label': sg_label,
             'data_table': table,
-            'cs_chart_html': cs_chart_html,
-            'cs_chart_script': cs_chart_script,
             'flows': json.dumps(flows),
             'phases': json.dumps(phases),
             'sg_median': json.dumps(sg_median),
@@ -1219,7 +1291,7 @@ new Chart(document.getElementById('sgChart'), {
             f.write(rendered)
 
     def _save_report(self, results, meta, timestamp, limit_reason,
-                     no_html, mode, gcmd=None, announce=True,
+                     no_html, gcmd=None, announce=True,
                      final_result=None):
         """Save CSV and HTML report. Safe to call repeatedly."""
         if not results:
@@ -1227,16 +1299,16 @@ new Chart(document.getElementById('sgChart'), {
         try:
             os.makedirs(self.output_dir, exist_ok=True)
             csv_path = os.path.join(
-                self.output_dir, 'tmc_flow_%s_%s.csv' % (mode, timestamp))
-            self._write_csv(csv_path, results, meta, mode)
+                self.output_dir, 'tmc_flow_%s.csv' % timestamp)
+            self._write_csv(csv_path, results, meta)
             if announce and gcmd is not None:
                 gcmd.respond_info("CSV saved: %s" % csv_path)
             if not no_html:
                 html_path = os.path.join(
                     self.output_dir,
-                    'tmc_flow_%s_%s.html' % (mode, timestamp))
+                    'tmc_flow_%s.html' % timestamp)
                 self._write_html(html_path, results, meta, limit_reason,
-                                 mode, final_result=final_result)
+                                 final_result=final_result)
                 if announce and gcmd is not None:
                     gcmd.respond_info("HTML saved: %s" % html_path)
         except Exception as e:
@@ -1248,19 +1320,17 @@ new Chart(document.getElementById('sgChart'), {
     # ─── Single flow step measurement ───────────────────────────────
 
     def _measure_step(self, gcmd, target_flow, step_duration, repeat,
-                      sample_cs=False, skip_warmup=True):
+                      skip_warmup=True):
         """Run a single flow measurement (multiple repetitions, aggregate)."""
         mm_per_sec = target_flow / self.filament_area
         feed_rate = mm_per_sec * 60.0
         extrude_length = mm_per_sec * step_duration
 
         per_run_sg = []
-        per_run_cs = []
         run_sg_avgs = []
-        run_cs_avgs = []
 
         for rep in range(repeat):
-            self._start_sampling(sample_cs=sample_cs)
+            self._start_sampling()
             try:
                 self.gcode.run_script_from_command(
                     "G1 E%.4f F%.1f\nM400" % (extrude_length, feed_rate))
@@ -1271,16 +1341,16 @@ new Chart(document.getElementById('sgChart'), {
             per_run_sg.append(run_sg)
             if run_sg:
                 run_sg_avgs.append(sum(run_sg) / len(run_sg))
-            if sample_cs:
-                run_cs = list(self.samples_cs)
-                per_run_cs.append(run_cs)
-                if run_cs:
-                    run_cs_avgs.append(sum(run_cs) / len(run_cs))
 
             if rep < repeat - 1:
                 self.gcode.run_script_from_command("G4 P300")
 
-        # Warmup-skip: if first run deviates >10% from rest, exclude it
+        # Warmup-skip: if first run deviates more than the profile's
+        # WARMUP_DRIFT_THRESHOLD from the rest, exclude it. The
+        # threshold is driver-specific because run-to-run drift
+        # varies significantly between TMC chip families:
+        #   TMC5160: ~10 % default (validated against historical CSVs)
+        #   TMC2240: 4 %  (the chip shows systematic 3-6 % drift on run 1)
         warmup_dropped = False
         included_indices = list(range(len(run_sg_avgs)))
         if skip_warmup and len(run_sg_avgs) >= 3:
@@ -1288,20 +1358,16 @@ new Chart(document.getElementById('sgChart'), {
             rest_mean = sum(run_sg_avgs[1:]) / len(run_sg_avgs[1:])
             if rest_mean > 0:
                 deviation = abs(run1 - rest_mean) / rest_mean
-                if deviation > 0.10:
+                if deviation > self.profile.WARMUP_DRIFT_THRESHOLD:
                     warmup_dropped = True
                     included_indices = list(range(1, len(run_sg_avgs)))
 
         # Aggregate from included runs
         agg_sg = []
-        agg_cs = []
         for idx in included_indices:
             agg_sg.extend(per_run_sg[idx])
-            if sample_cs and idx < len(per_run_cs):
-                agg_cs.extend(per_run_cs[idx])
 
         sg_stats = self._stats(agg_sg)
-        cs_stats = self._stats(agg_cs) if sample_cs else None
 
         included_sg_avgs = [run_sg_avgs[i] for i in included_indices
                             if i < len(run_sg_avgs)]
@@ -1322,25 +1388,17 @@ new Chart(document.getElementById('sgChart'), {
         cv_str = ("%.1f%%" % run_consistency['sg_cv']
                   if run_consistency else 'n/a')
         warmup_str = ' [run 1 excluded as warmup]' if warmup_dropped else ''
-        if sample_cs and cs_stats is not None:
-            cs_med_str = "%.0f" % cs_stats['median']
-            gcmd.respond_info(
-                "  %.1f mm³/s | SG median = %s | CS median = %s | "
-                "run-to-run CV = %s%s"
-                % (target_flow, sg_med_str, cs_med_str, cv_str, warmup_str))
-        else:
-            gcmd.respond_info(
-                "  %.1f mm³/s | SG median = %s | "
-                "run-to-run CV = %s%s"
-                % (target_flow, sg_med_str, cv_str, warmup_str))
+        gcmd.respond_info(
+            "  %.1f mm³/s | SG median = %s | "
+            "run-to-run CV = %s%s"
+            % (target_flow, sg_med_str, cv_str, warmup_str))
 
         return {
             'flow': target_flow,
             'sg': sg_stats,
-            'cs': cs_stats,
             'run_consistency': run_consistency,
             'run_sg_avgs': run_sg_avgs,
-            'run_cs_avgs': run_cs_avgs,
+            'warmup_dropped': warmup_dropped,
         }
 
     # ─── Trigger detection — SG-only mode ──────────────────────────
@@ -1360,13 +1418,11 @@ new Chart(document.getElementById('sgChart'), {
     def _sg_jump_threshold(self):
         """Minimum raw |SG delta| considered a real (non-noise) jump.
 
-        SG4 (TMC2240/2209) operates in a 0-510 range, slip jumps are
-        typically >30 raw units. SG2 (TMC5160 etc.) often runs in a
-        narrower 0-150 range; jumps as small as 5-10 can signal a slip.
+        Uses the driver-specific profile value, which captures the
+        relationship between SG scale and jump magnitudes for that
+        chip family.
         """
-        if self.sg2_driver:
-            return 5
-        return 15
+        return self.profile.SG_JUMP_THRESHOLD
 
     def _check_triggers_sg(self, results):
         """SG-based slip detection.
@@ -1480,17 +1536,31 @@ new Chart(document.getElementById('sgChart'), {
                                    actual_load / expected_load))
 
                     # Trigger 2: plateau over 2 steps, only meaningful
-                    # when the trend is sizeable. Threshold at 0.5 —
-                    # anything tighter gives false positives on
-                    # naturally asymptotic SG curves where each step
-                    # falls by a smaller increment than the last.
-                    if expected_load > 5:
+                    # when the trend is sizeable. The threshold is
+                    # driver-specific (PLATEAU_RATIO in the profile)
+                    # because the steepness of the SG-vs-load
+                    # saturation curve varies between chip families.
+                    #
+                    # Restricted to the coarse phase only: in
+                    # bisection / verify, flow probes can step in
+                    # either direction (e.g. 45 → 42 → 44 → 43), and
+                    # the trend baseline assumption breaks down. The
+                    # `going_up` check above doesn't catch this
+                    # because individual bisect probes are still
+                    # locally upward — but the prior-step deltas in
+                    # bisection mode reflect bisection bracket logic,
+                    # not the smooth coarse sweep this trigger
+                    # assumes.
+                    last_phase = results[-1].get('phase', 'coarse')
+                    if (expected_load > 5
+                            and last_phase == 'coarse'):
                         prev_actual = (results[-2]['sg']['median']
                                        - results[-3]['sg']['median'])
                         cumulative_load = (actual_load
                                            + prev_actual * trend_sign)
                         expected_2step = expected_load * 2
-                        if cumulative_load < expected_2step * 0.5:
+                        if cumulative_load < (expected_2step
+                                              * self.profile.PLATEAU_RATIO):
                             direction = ("rising" if trend_sign > 0
                                          else "falling")
                             return ("%s plateau over 2 steps: %s trend "
@@ -1605,13 +1675,13 @@ new Chart(document.getElementById('sgChart'), {
                                         + sorted_cv[n // 2]) / 2)
 
         # Pattern (a): high-variance trip — works without baseline
-        if last_cv >= 10.0:
+        if last_cv >= self.profile.CV_HIGH_VARIANCE:
             if not prior_cvs:
                 return ("run-to-run %s CV spiked to %.1f%% — repeats "
                         "diverging, intermittent slip"
                         % (sg_label, last_cv))
             avg_prior_cv = sum(prior_cvs) / len(prior_cvs)
-            if last_cv >= 1.5 * avg_prior_cv:
+            if last_cv >= self.profile.CV_LOWBASE_RATIO * avg_prior_cv:
                 return ("run-to-run %s CV spiked to %.1f%% (baseline "
                         "~%.1f%% over previous 3 steps) — repeats "
                         "diverging, intermittent slip"
@@ -1622,8 +1692,10 @@ new Chart(document.getElementById('sgChart'), {
         avg_prior_cv = sum(prior_cvs) / len(prior_cvs)
 
         # Pattern (b): low-baseline jump vs immediate prior
-        b_ratio = 2.0 if in_bisection else 2.5
-        b_min_cv = 4.0 if in_bisection else 5.0
+        b_ratio = (self.profile.CV_JUMP_RATIO_BISECT if in_bisection
+                   else self.profile.CV_JUMP_RATIO_COARSE)
+        b_min_cv = (self.profile.CV_JUMP_MIN_BISECT if in_bisection
+                    else self.profile.CV_JUMP_MIN_COARSE)
         if last_cv >= b_min_cv and last_cv >= b_ratio * avg_prior_cv:
             return ("run-to-run %s CV jumped to %.1f%% (%.1fx baseline "
                     "of %.1f%% over previous 3 steps) — repeats "
@@ -1632,12 +1704,14 @@ new Chart(document.getElementById('sgChart'), {
                        last_cv / avg_prior_cv, avg_prior_cv))
 
         # Pattern (c): rising CV trend across 2 consecutive steps.
-        c_min_cv = 4.0 if in_bisection else 5.0
+        c_min_cv = (self.profile.CV_RISING_MIN_LAST_BISECT if in_bisection
+                    else self.profile.CV_RISING_MIN_LAST_COARSE)
+        c_ratio = self.profile.CV_RISING_RATIO
         if (last_cv >= c_min_cv
                 and len(prior_cvs) >= 2
-                and prior_cvs[-1] >= 1.3 * prior_cvs[-2]
-                and last_cv >= 1.3 * prior_cvs[-1]
-                and prior_cvs[-1] >= 2.5):
+                and prior_cvs[-1] >= c_ratio * prior_cvs[-2]
+                and last_cv >= c_ratio * prior_cvs[-1]
+                and prior_cvs[-1] >= self.profile.CV_RISING_MIN_PRIOR):
             return ("run-to-run %s CV rising across 3 steps "
                     "(%.1f%% → %.1f%% → %.1f%%) — gradual slip onset"
                     % (sg_label, prior_cvs[-2], prior_cvs[-1], last_cv))
@@ -1649,8 +1723,9 @@ new Chart(document.getElementById('sgChart'), {
         # subsequent elevated values.
         if (in_bisection
                 and coarse_baseline_cv is not None
-                and last_cv >= 5.0
-                and last_cv >= 2.0 * coarse_baseline_cv):
+                and last_cv >= self.profile.CV_VS_COARSE_MIN
+                and last_cv >=
+                    self.profile.CV_VS_COARSE_RATIO * coarse_baseline_cv):
             return ("run-to-run %s CV %.1f%% in bisection vs coarse-"
                     "phase baseline %.1f%% (%.1fx) — slip signature "
                     "above clean-extrusion noise floor"
@@ -1696,7 +1771,7 @@ new Chart(document.getElementById('sgChart'), {
 
         # (c) absolute — fires unconditionally on any genuinely large
         # IQR during bisection / verify. Cheap and reliable.
-        if in_bisection and last_iqr >= 25:
+        if in_bisection and last_iqr >= self.profile.IQR_ABSOLUTE_TRIGGER:
             return ("%s spread widened: IQR %.0f raw units in %s — "
                     "samples no longer cluster, intermittent stall"
                     % (sg_label, last_iqr, last_phase))
@@ -1707,13 +1782,50 @@ new Chart(document.getElementById('sgChart'), {
         if avg_prior_iqr < 1:
             return None
 
-        # (a) ratio vs immediate prior steps
-        ratio_threshold = 1.7 if in_bisection else 3.0
-        if last_iqr >= 12 and last_iqr >= ratio_threshold * avg_prior_iqr:
-            return ("%s spread widened: IQR %.0f vs baseline ~%.0f "
-                    "(%.1fx) — quiet/intermittent stall in samples"
-                    % (sg_label, last_iqr, avg_prior_iqr,
-                       last_iqr / avg_prior_iqr))
+        # (a) ratio vs immediate prior steps.
+        # If the profile requires CV cross-check (e.g. SG4 drivers with
+        # active CoolStep), confirm with the run-to-run CV — without
+        # elevated CV, a wide IQR is likely a CoolStep-current-transition
+        # effect, not slip. Genuine slip raises both within-step spread
+        # AND run-to-run variance.
+        ratio_threshold = (self.profile.IQR_RATIO_BISECT if in_bisection
+                           else self.profile.IQR_RATIO_COARSE)
+        if (last_iqr >= self.profile.IQR_RATIO_MIN_ABS
+                and last_iqr >= ratio_threshold * avg_prior_iqr):
+            cv_confirms = True
+            cv_note = ""
+            if self.profile.IQR_RATIO_REQUIRE_CV:
+                last_rc = last.get('run_consistency') or {}
+                last_cv_a = last_rc.get('sg_cv')
+                cv_floor = (self.profile.IQR_RATIO_CV_FLOOR_BISECT
+                            if in_bisection
+                            else self.profile.IQR_RATIO_CV_FLOOR_COARSE)
+                # Build prior-CV baseline same way as prior-IQR baseline
+                prior_cvs_a = []
+                for r in results[-4:-1]:
+                    rc = r.get('run_consistency') or {}
+                    if 'sg_cv' in rc:
+                        prior_cvs_a.append(rc['sg_cv'])
+                avg_prior_cv = (sum(prior_cvs_a) / len(prior_cvs_a)
+                                if prior_cvs_a else 0.0)
+                # CV must be elevated above absolute floor AND above
+                # baseline (or baseline must be tiny). 1.4× ratio is
+                # less strict than the value-based jump triggers in
+                # _check_cv_spike — IQR pattern (a) only needs CV to
+                # *not contradict* the spread anomaly.
+                cv_confirms = (last_cv_a is not None
+                               and last_cv_a >= cv_floor
+                               and (avg_prior_cv < 0.5
+                                    or last_cv_a >= 1.4 * avg_prior_cv))
+                if cv_confirms and last_cv_a is not None:
+                    cv_note = (" (CV %.1f%% confirms, prior ~%.1f%%)"
+                               % (last_cv_a, avg_prior_cv))
+            if cv_confirms:
+                return ("%s spread widened: IQR %.0f vs baseline ~%.0f "
+                        "(%.1fx) — quiet/intermittent stall in samples"
+                        "%s"
+                        % (sg_label, last_iqr, avg_prior_iqr,
+                           last_iqr / avg_prior_iqr, cv_note))
 
         # (b) ratio vs coarse baseline (bisection only).
         # Cross-check with CV: a pure spread anomaly with NORMAL CV is
@@ -1748,15 +1860,23 @@ new Chart(document.getElementById('sgChart'), {
                                           + sorted_cv[m // 2]) / 2)
                 last_rc = last.get('run_consistency') or {}
                 last_cv = last_rc.get('sg_cv', 0.0)
-                # CV cross-check: must be elevated vs coarse AND >=3%
-                # absolute. If CV is below baseline-ish, it's not slip
-                # — it's a wide-distribution fluke.
-                cv_confirms = (last_cv >= 3.0
-                               and median_coarse_cv >= 0.5
-                               and last_cv >= 1.5 * median_coarse_cv)
+                # CV cross-check: must be elevated vs coarse AND above
+                # an absolute floor. If CV is below baseline-ish, it's
+                # not slip — it's a wide-distribution fluke.
+                if self.profile.IQR_VS_COARSE_REQUIRE_CV:
+                    cv_confirms = (
+                        last_cv >= self.profile.IQR_VS_COARSE_CV_FLOOR
+                        and median_coarse_cv >= 0.5
+                        and last_cv >=
+                            (self.profile.IQR_VS_COARSE_CV_RATIO
+                             * median_coarse_cv))
+                else:
+                    cv_confirms = True
                 if (median_coarse_iqr >= 1
-                        and last_iqr >= 18
-                        and last_iqr >= 2.5 * median_coarse_iqr
+                        and last_iqr >= self.profile.IQR_VS_COARSE_MIN_ABS
+                        and last_iqr >=
+                            (self.profile.IQR_VS_COARSE_RATIO
+                             * median_coarse_iqr)
                         and cv_confirms):
                     return ("%s spread IQR %.0f in %s vs coarse-phase "
                             "median IQR ~%.0f (%.1fx); CV %.1f%% also "
@@ -1841,18 +1961,22 @@ new Chart(document.getElementById('sgChart'), {
             # (a) Strong ratio + above coarse: max is dramatically
             #     above median AND clearly above what coarse saw.
             # (b) Big absolute jump: max is far above median AND the
-            #     gap (max - median) is at least 200 raw units. This
-            #     covers narrow-range drivers (e.g. TMC2209) where
-            #     coarse_max can already sit near the no-load value.
-            absolute_floor = 200 if self.sg2_driver else 150
+            #     gap (max - median) is large. This covers narrow-range
+            #     drivers (e.g. TMC2209) where coarse_max can already
+            #     sit near the no-load value.
+            absolute_floor = (self.profile.SG_MAX_ABS_GAP
+                              if self.sg2_driver
+                              else self.profile.SG_MAX_ABS_GAP_SG4)
             ratio_vs_coarse = (last_max
                                / max(median_coarse_max, 1))
             ratio_vs_med = last_max / max(last_med, 1)
-            big_gap = (last_max - last_med) >= 300
-            fires_a = (ratio_vs_med >= 3.0
-                       and ratio_vs_coarse >= 1.3
+            big_gap = (last_max - last_med) >= self.profile.SG_MAX_BIG_GAP
+            fires_a = (ratio_vs_med >= self.profile.SG_MAX_RATIO_TO_MEDIAN
+                       and ratio_vs_coarse >=
+                            self.profile.SG_MAX_RATIO_TO_COARSE
                        and last_max - last_med >= absolute_floor)
-            fires_b = (ratio_vs_med >= 4.0 and big_gap)
+            fires_b = (ratio_vs_med >= self.profile.SG_MAX_BIG_RATIO
+                       and big_gap)
             if fires_a or fires_b:
                 return ("%s max %.0f in this step is %.1fx the "
                         "median (%.0f) and %.1fx the typical coarse "
@@ -1867,8 +1991,10 @@ new Chart(document.getElementById('sgChart'), {
                 return None
             median_coarse_min = _median(coarse_mins[:-1])
             if (last_min > 0
-                    and last_min <= last_med / 3.0
-                    and last_med - last_min >= 80):
+                    and last_min <=
+                        last_med / self.profile.SG_MIN_RATIO_TO_MEDIAN
+                    and last_med - last_min >=
+                        self.profile.SG_MIN_ABS_GAP):
                 return ("%s min %.0f is %.1fx below the median (%.0f)"
                         " — at least one repeat dropped to no-load "
                         "value (decoupling)"
@@ -1881,29 +2007,43 @@ new Chart(document.getElementById('sgChart'), {
         """Detect when one of the per-run averages is an outlier.
 
         Each measurement step runs N repeats (default 5). We have the
-        list of per-run SG averages and per-run CS averages. If the
-        run-to-run variance is dominated by a SINGLE outlying run
-        (one repeat much off, the others tight), the median absorbs it
-        but it's clear evidence of intermittent slip.
+        list of per-run SG averages. If the run-to-run variance is
+        dominated by a SINGLE outlying run (one repeat much off, the
+        others tight), the median absorbs it but it's clear evidence
+        of intermittent slip.
 
         Detection:
           - At least 4 valid runs
           - Find the run whose SG_avg deviates most from the median of
             the other runs
-          - If that deviation is > 2x the median absolute deviation
-            (MAD) of the rest, it's an outlier
-          - Plus: corresponding CS_avg should also deviate (load really
-            changed). CS-variation > 1.5 between min and max OR min CS
-            < 28 while median is >= 30 confirms.
+          - If that deviation is > 4x the median absolute deviation
+            (MAD) of the rest AND >= 8 % of the median, it's an outlier
 
-        Only fires in verify (where we care about reproducibility) or
-        in bisection at small bracket widths.
+        If warmup was dropped during stats aggregation (run 1 deviated
+        too much from the rest), this check operates only on the
+        warmup-included runs (runs 2..N) — otherwise it would
+        re-flag the warmup run as an outlier, defeating the purpose
+        of the warmup-skip.
+
+        Only fires in bisect or verify (where we care about
+        reproducibility, not coarse exploration).
         """
         last = results[-1]
         if last.get('phase') not in ('bisect', 'verify'):
             return None
-        run_sg = last.get('run_sg_avgs') or []
-        run_cs = last.get('run_cs_avgs') or []
+        all_run_sg = last.get('run_sg_avgs') or []
+        warmup_dropped = last.get('warmup_dropped', False)
+
+        # If warmup was excluded from stats, also exclude it from
+        # outlier analysis. The displayed run number compensates for
+        # the offset so reports refer to the original run index.
+        if warmup_dropped and len(all_run_sg) >= 1:
+            run_sg = all_run_sg[1:]
+            run_idx_offset = 1
+        else:
+            run_sg = all_run_sg
+            run_idx_offset = 0
+
         if len(run_sg) < 4:
             return None
 
@@ -1938,36 +2078,20 @@ new Chart(document.getElementById('sgChart'), {
         # near zero).
         if mad_rest < 0.5:
             mad_rest = 0.5  # noise floor
-        if not (outlier_dev >= 4.0 * mad_rest
-                and outlier_dev >= 0.08 * median_rest):
+        if not (outlier_dev >= self.profile.OUTLIER_MAD_RATIO * mad_rest
+                and outlier_dev >=
+                    self.profile.OUTLIER_MIN_REL * median_rest):
             return None
 
-        # Confirm with CS variation (CoolStep should have noticed).
-        cs_confirms = False
-        cs_note = ""
-        if len(run_cs) == n:
-            cs_min = min(run_cs)
-            cs_max = max(run_cs)
-            cs_med = sorted(run_cs)[n // 2]
-            # CS dropped on the outlier run? OR overall CS spread > 1.5?
-            if cs_min <= cs_med - 1.5 or (cs_max - cs_min) >= 2.0:
-                cs_confirms = True
-                cs_note = (" (run %d CS=%.1f vs median %.1f)"
-                           % (outlier_idx + 1,
-                              run_cs[outlier_idx], cs_med))
-
-        # In verify, also accept SG-only outliers (because verify is
-        # the last line of defence and false-positives there cost
-        # only one verify retry, not a wrong final result).
-        last_phase = last.get('phase')
-        if not cs_confirms and last_phase != 'verify':
-            return None
-
+        # SG-only outlier detection. Index reporting uses the
+        # original run number (1-based), accounting for the warmup
+        # offset so the user can identify which CSV row corresponds.
+        original_run_num = outlier_idx + 1 + run_idx_offset
         return ("run %d is an outlier (SG_avg %.1f vs %.1f for the "
-                "other repeats, %.1fx MAD)%s — at least one of the "
+                "other repeats, %.1fx MAD) — at least one of the "
                 "repeats stalled while the others ran clean"
-                % (outlier_idx + 1, run_sg[outlier_idx],
-                   median_rest, outlier_dev / mad_rest, cs_note))
+                % (original_run_num, run_sg[outlier_idx],
+                   median_rest, outlier_dev / mad_rest))
 
     def _is_borderline(self, results):
         """Detect if the latest bisection step sits in a 'gray zone'
@@ -2031,21 +2155,27 @@ new Chart(document.getElementById('sgChart'), {
 
         # CV gray zone: elevated but not screaming
         cv_borderline = (last_cv is not None
-                         and 4.0 <= last_cv < 7.0
+                         and self.profile.BORDER_CV_LOW <= last_cv
+                                                       < self.profile.BORDER_CV_HIGH
                          and (coarse_med_cv < 1
-                              or last_cv >= 1.5 * coarse_med_cv))
+                              or last_cv >=
+                                  self.profile.BORDER_CV_RATIO
+                                  * coarse_med_cv))
 
         # IQR gray zone: wide but not extreme. Cross-check with CV — a
         # widened IQR with a very LOW CV is usually just one outlier
         # sample stretching the percentiles, not real intermittent
         # slip. Genuine slip widens both spread and run-to-run noise.
-        # We require CV at least 2% absolute (more than typical clean
-        # noise) for IQR-only borderlines to count.
-        iqr_borderline = (15 <= last_iqr < 25
+        # We require CV at least BORDER_IQR_CV_FLOOR (more than typical
+        # clean noise) for IQR-only borderlines to count.
+        iqr_borderline = (self.profile.BORDER_IQR_LOW <= last_iqr
+                                                      < self.profile.BORDER_IQR_HIGH
                           and (coarse_med_iqr < 1
-                               or last_iqr >= 1.7 * coarse_med_iqr)
+                               or last_iqr >=
+                                   self.profile.BORDER_IQR_RATIO
+                                   * coarse_med_iqr)
                           and last_cv is not None
-                          and last_cv >= 2.0)
+                          and last_cv >= self.profile.BORDER_IQR_CV_FLOOR)
 
         if cv_borderline and iqr_borderline:
             return ("CV %.1f%% (vs coarse ~%.1f%%) AND IQR %.0f "
@@ -2113,242 +2243,6 @@ new Chart(document.getElementById('sgChart'), {
             'n_steps': len(coarse_cvs),
         }
 
-    def _check_triggers_cs(self, results, baseline_cs):
-        """CoolStep + SG triggers — robust for ACTIVE CoolStep regulation.
-
-        AUTO-DETECTS whether CoolStep is actually changing CS_ACTUAL.
-        If CS is essentially static (range < 1.0), falls back to SG-only.
-
-        --- Background ---
-        When CoolStep is actively regulating across the test flow range,
-        CS rises gradually with load (e.g. 8 → 15 → 22 → 28 → 31). This
-        is NORMAL behaviour, not slip — but the old "+5 step jump"
-        heuristic interpreted every regulation step as slip.
-
-        New trigger philosophy: a CS-jump alone is NOT a slip indicator
-        when CoolStep is active. A real slip event is characterized by:
-          (1) CS reaches FULL maximum (≥ 30) — not just "up a bit"
-          (2) Previously CS was actually regulating below max (proves
-              CoolStep wasn't already pegged from the start)
-          (3) Confirmation from a second signal:
-              - SG drops sharply (>=30% vs prior step), OR
-              - run-to-run CV spikes, OR
-              - SG snap-back / over-jump signature
-
-        CS-based triggers (when CoolStep is active):
-          A1. CS pegged at max + SG sharp drop — confirmed slip
-          A2. CS pegged at max + CV spike — intermittent slip
-          A3. CS hard drop after regulation — motor lost load contact
-        SG triggers (always evaluated):
-          B1. Snap-back / over-jump (data-driven trend detection)
-          B2. CV spike (from _check_cv_spike helper)
-        """
-        if not results or len(results) < 3:
-            return None
-        r = results[-1]
-        sg_stats = r['sg']
-        cs_stats = r['cs']
-        target_flow = r['flow']
-
-        if cs_stats is None or cs_stats['n'] == 0:
-            return None
-
-        prev_cs = results[-2].get('cs')
-        prev2_cs = results[-3].get('cs')
-        if not prev_cs or not prev2_cs:
-            return None
-
-        # Detect mode: is CoolStep actually varying?
-        cs_meds = [r_['cs']['median'] for r_ in results
-                   if r_.get('cs') and r_['cs'].get('median') is not None]
-        cs_range = max(cs_meds) - min(cs_meds) if len(cs_meds) >= 2 else 0
-        coolstep_active = cs_range > 1.0
-
-        prev_flow = results[-2].get('flow', 0)
-        going_up_or_same = target_flow >= prev_flow - 0.001
-        # Bisection / verify probe flows in arbitrary order, so the
-        # going_up_or_same gate (which exists to suppress false-
-        # positives during the monotonically-increasing coarse sweep)
-        # must NOT block triggers in those phases. A stall is a stall
-        # regardless of whether the previous probe was higher or lower.
-        last_phase = results[-1].get('phase', 'coarse')
-        in_bisection = last_phase in ('bisect', 'verify')
-        evaluate_triggers = going_up_or_same or in_bisection
-
-        cs_med = cs_stats['median']
-        sg_med = sg_stats['median'] if sg_stats and sg_stats['n'] > 0 else None
-        sg_label = self._get_sg_label()
-
-        # ─── CoolStep-based triggers (only when CS actually regulates) ───
-        # Use stricter thresholds when CoolStep is active to avoid
-        # false-positives from normal regulation transitions.
-        CS_FULL_MAX = 30.0      # CS_ACTUAL=31 is hardware max for TMC drivers
-        CS_REGULATING_HIGH = 25.0  # below this = CoolStep was actively regulating
-
-        if coolstep_active:
-            cs_step_change = cs_med - prev_cs['median']
-
-            # Check: was CS regulating below the high threshold within
-            # the recent history? (Not just the immediately previous step
-            # — gradual ramp-up like 22→28→31 should still count as
-            # "transitioned to max from regulation".)
-            recent_cs_was_regulating = any(
-                r_.get('cs') and r_['cs']['median'] < CS_REGULATING_HIGH
-                for r_ in results[-4:-1]  # last 3 steps before current
-            )
-
-            # A1: CS pegged at max + SG sharp drop (the canonical slip signature)
-            #     - Current CS at maximum (>= 30)
-            #     - CS was actually regulating recently (proves we
-            #       weren't already pegged for the entire run)
-            #     - SG dropped >= 30% vs previous step (load really increased)
-            if (evaluate_triggers
-                    and cs_med >= CS_FULL_MAX
-                    and recent_cs_was_regulating
-                    and sg_med is not None
-                    and results[-2].get('sg')
-                    and results[-2]['sg'].get('median') is not None
-                    and results[-2]['sg']['median'] > 0):
-                prev_sg = results[-2]['sg']['median']
-                sg_drop_pct = (prev_sg - sg_med) / prev_sg * 100.0
-                if sg_drop_pct >= 30.0:
-                    return ("CS_ACTUAL pegged at max (%.0f → %.0f) "
-                            "AND %s dropped %.0f%% (%.0f → %.0f) — "
-                            "load suddenly increased to limit, slip "
-                            "detected"
-                            % (prev_cs['median'], cs_med,
-                               sg_label, sg_drop_pct, prev_sg, sg_med))
-
-            # A2: CS pegged at max + CV spike (intermittent slip)
-            #     CoolStep regulated then suddenly maxed, AND repeats
-            #     started diverging — clear sign of intermittent slip.
-            if (evaluate_triggers
-                    and cs_med >= CS_FULL_MAX
-                    and recent_cs_was_regulating):
-                last_rc = r.get('run_consistency') or {}
-                last_cv = last_rc.get('sg_cv', 0)
-                if last_cv >= 5.0:
-                    cv_reason = self._check_cv_spike(results, sg_label)
-                    if cv_reason:
-                        return ("CS_ACTUAL pegged at max (%.0f → %.0f) "
-                                "AND %s"
-                                % (prev_cs['median'], cs_med, cv_reason))
-
-            # A3: CS hard drop after regulation (hard stall — motor decoupled)
-            #     CS dropped sharply after having been regulating.
-            #     Indicates motor lost contact with the load entirely.
-            if (evaluate_triggers
-                    and prev_cs['median'] >= CS_REGULATING_HIGH
-                    and cs_step_change < -8.0):
-                had_regulation = any(
-                    r_.get('cs') and r_['cs']['median'] < CS_REGULATING_HIGH
-                    for r_ in results[:-1])
-                if had_regulation:
-                    return ("CS_ACTUAL dropped %.1f in one step "
-                            "(median %.1f → %.1f) — hard stall: "
-                            "motor lost load contact"
-                            % (-cs_step_change, prev_cs['median'], cs_med))
-
-        # ─── SG trend triggers (snap-back / over-jump) ───
-        # These are direction-sensitive and meaningful only during the
-        # monotonic up-sweep of coarse phase. In bisection we probe
-        # arbitrary flows, so the trend baseline is meaningless — we
-        # rely on CV-spike and IQR-spread (below) instead.
-        if (going_up_or_same
-                and not in_bisection
-                and sg_med is not None
-                and sg_med > self._sg_min_informative()
-                and len(results) >= 4):
-            sg_deltas = []
-            for j in range(max(1, len(results) - 5), len(results) - 1):
-                rj, rj_prev = results[j], results[j-1]
-                if not (rj.get('sg') and rj_prev.get('sg')
-                        and rj.get('cs') and rj_prev.get('cs')):
-                    continue
-                # When CoolStep is actively regulating, SG values can
-                # be biased by the changing current — exclude steps
-                # where CS was at max from the trend baseline.
-                if coolstep_active:
-                    if (rj['cs']['median'] >= CS_FULL_MAX
-                            or rj_prev['cs']['median'] >= CS_FULL_MAX):
-                        continue
-                sg_deltas.append(
-                    rj['sg']['median'] - rj_prev['sg']['median'])
-
-            if len(sg_deltas) >= 3:
-                expected_delta = sum(sg_deltas) / len(sg_deltas)
-                actual_delta = (sg_med - results[-2]['sg']['median'])
-
-                # Detect trend direction from the data, then look for
-                # a sharp move opposite to the trend.
-                if expected_delta > 1.0:
-                    trend_sign = +1
-                elif expected_delta < -1.0:
-                    trend_sign = -1
-                else:
-                    trend_sign = 0
-
-                if trend_sign != 0:
-                    expected_load = expected_delta * trend_sign
-                    actual_load = actual_delta * trend_sign
-
-                    # Snap-back
-                    if (actual_load < -expected_load
-                            and abs(actual_delta) > self._sg_jump_threshold()):
-                        if trend_sign > 0:
-                            return ("%s reload jump: %+.0f (expected "
-                                    "to keep rising ~+%.0f) — slip "
-                                    "detected"
-                                    % (sg_label, actual_delta,
-                                       expected_load))
-                        return ("%s reload jump: %+.0f (expected to "
-                                "keep falling ~-%.0f) — slip detected"
-                                % (sg_label, actual_delta,
-                                   expected_load))
-
-                    # Over-jump
-                    if (actual_load > expected_load * 2.0
-                            and abs(actual_delta) > self._sg_jump_threshold()):
-                        if trend_sign > 0:
-                            return ("%s abnormal jump: %+.0f vs "
-                                    "expected ~+%.0f (%.1fx larger) — "
-                                    "slip detected"
-                                    % (sg_label, actual_delta,
-                                       expected_load,
-                                       actual_load / expected_load))
-                        return ("%s abnormal drop: %+.0f vs expected "
-                                "~-%.0f (%.1fx larger) — slip detected"
-                                % (sg_label, actual_delta,
-                                   expected_load,
-                                   actual_load / expected_load))
-
-        # CV spike fallback — also fires in CS mode (catches intermittent
-        # slip even when CS-based triggers above don't fire because
-        # CoolStep is regulating smoothly).
-        if evaluate_triggers:
-            cv_reason = self._check_cv_spike(results, sg_label)
-            if cv_reason:
-                return cv_reason
-
-            # IQR/spread anomaly fallback — catches "quiet" stalls
-            # where median is hidden but distribution widens.
-            iqr_reason = self._check_iqr_spread(results, sg_label)
-            if iqr_reason:
-                return iqr_reason
-
-            # SG max spike — decoupling event in at least one repeat.
-            spike_reason = self._check_sg_max_spike(results, sg_label)
-            if spike_reason:
-                return spike_reason
-
-            # Per-run outlier — one of the N repeats was clearly
-            # different from the others (intermittent slip).
-            outlier_reason = self._check_run_outlier(results, sg_label)
-            if outlier_reason:
-                return outlier_reason
-
-        return None
-
     # ─── Helper: rotation_distance lookup ───────────────────────────
 
     def _get_rotation_distance(self, extruder):
@@ -2373,7 +2267,7 @@ new Chart(document.getElementById('sgChart'), {
     # ─── TMC_FLOW_STATUS — diagnostic ───────────────────────────────
 
     def cmd_TMC_FLOW_STATUS(self, gcmd):
-        """Show current TMC SG/CS values for the extruder."""
+        """Show current TMC SG values and configuration status."""
         self._lookup_tmc()
         activate = gcmd.get_int('ACTIVATE', 1, minval=0, maxval=1)
 
@@ -2387,54 +2281,21 @@ new Chart(document.getElementById('sgChart'), {
             % (self.driver_type or 'unknown', self.stepper_name))
 
         sg = self._read_sg()
-        cs = self._read_cs()
         sg_label = self._get_sg_label()
         gcmd.respond_info(
             "%s: %s (range 0-510, lower = more load)"
             % (sg_label, str(sg) if sg is not None else 'n/a'))
-        gcmd.respond_info(
-            "CS_ACTUAL: %s (CoolStep current scale, 0-31)"
-            % (str(cs) if cs is not None else 'n/a'))
 
-        # Detect which mode the user has configured for
-        semin = self._read_cs_semin()
-        if semin == 0:
-            preferred_mode = 'sg'
-            gcmd.respond_info(
-                "→ Detected configuration: CoolStep DISABLED "
-                "(driver_SEMIN=0)\n"
-                "  Run: TMC_FLOW_FIND_MAX  "
-                "(auto-selects SG-only mode for this config)")
-        else:
-            preferred_mode = 'cs'
-            gcmd.respond_info(
-                "→ Detected configuration: CoolStep ENABLED "
-                "(driver_SEMIN=%d)\n"
-                "  Run: TMC_FLOW_FIND_MAX  "
-                "(auto-selects CoolStep mode for this config)" % semin)
-
-        # Run check for the preferred mode and show results
-        problems, infos = self._check_tmc_config(preferred_mode)
+        # Run config check
+        problems, infos = self._check_tmc_config()
         if problems:
-            gcmd.respond_info(
-                "Configuration issues found for %s mode:"
-                % preferred_mode.upper())
+            gcmd.respond_info("Configuration issues found:")
             for fname, val, _desc in problems:
                 gcmd.respond_info("  ⚠ %s = %s" % (fname, val))
         else:
-            gcmd.respond_info(
-                "✓ Configuration looks good for %s mode."
-                % preferred_mode.upper())
+            gcmd.respond_info("✓ Configuration looks good.")
         for info in infos:
             gcmd.respond_info(info)
-
-    def _read_cs_semin(self):
-        """Helper: read semin to determine current mode. 0 if unknown."""
-        try:
-            val = self.tmc.fields.get_field('semin')
-            return val if val is not None else 0
-        except (KeyError, AttributeError):
-            return 0
 
     def _snapshot_tmc_settings(self):
         """Read TMC register state most relevant to this test.
@@ -2499,71 +2360,12 @@ new Chart(document.getElementById('sgChart'), {
     # ─── Main commands ──────────────────────────────────────────────
 
     def cmd_TMC_FLOW_FIND_MAX(self, gcmd):
-        """Auto-detect mode from driver_SEMIN, then run flow test.
-
-        Optional MODE parameter to override:
-          MODE=auto  (default) — detect from driver_SEMIN
-          MODE=sg              — force SG-only mode
-          MODE=cs              — force CoolStep + SG mode
-        """
+        """Run the StallGuard-based flow test."""
         self._lookup_tmc()
+        self._run_find_max(gcmd)
 
-        mode_param = gcmd.get('MODE', 'auto').lower()
-
-        if mode_param == 'auto':
-            # Auto-detect from driver_SEMIN
-            try:
-                semin = self.tmc.fields.get_field('semin')
-                if semin is None:
-                    semin = 0
-            except (KeyError, AttributeError):
-                raise gcmd.error(
-                    "Could not read driver_SEMIN to auto-detect mode. "
-                    "Please specify MODE=sg or MODE=cs explicitly.")
-
-            if semin == 0:
-                mode = 'sg'
-                gcmd.respond_info(
-                    "Auto-detect: driver_SEMIN = 0 → CoolStep is disabled. "
-                    "Using SG-only mode.")
-            else:
-                mode = 'cs'
-                gcmd.respond_info(
-                    "Auto-detect: driver_SEMIN = %d → CoolStep is enabled. "
-                    "Using CoolStep + SG mode." % semin)
-        elif mode_param == 'sg':
-            mode = 'sg'
-            gcmd.respond_info("Mode forced via MODE=sg parameter.")
-        elif mode_param == 'cs':
-            mode = 'cs'
-            gcmd.respond_info("Mode forced via MODE=cs parameter.")
-        else:
-            raise gcmd.error(
-                "Invalid MODE parameter: '%s'. Use 'auto', 'sg', or 'cs'."
-                % mode_param)
-
-        self._mode = mode
-        self._run_find_max(gcmd, mode=mode)
-
-    def cmd_TMC_FLOW_FIND_MAX_SG(self, gcmd):
-        """Force SG-only mode — for setups with CoolStep disabled.
-
-        Equivalent to: TMC_FLOW_FIND_MAX MODE=sg
-        """
-        self._mode = 'sg'
-        self._run_find_max(gcmd, mode='sg')
-
-    def cmd_TMC_FLOW_FIND_MAX_CS(self, gcmd):
-        """Force CoolStep + SG mode — for setups with CoolStep enabled.
-
-        Equivalent to: TMC_FLOW_FIND_MAX MODE=cs
-        """
-        self._mode = 'cs'
-        self._run_find_max(gcmd, mode='cs')
-
-    def _run_find_max(self, gcmd, mode):
-        """Common bracket-bisection algorithm. Trigger logic switches
-        based on mode."""
+    def _run_find_max(self, gcmd):
+        """Common bracket-bisection algorithm using SG triggers."""
         self._lookup_tmc()
 
         start_flow = gcmd.get_float('START', 10.0, above=0.)
@@ -2589,10 +2391,9 @@ new Chart(document.getElementById('sgChart'), {
 
         # ─── TMC config check ───
         if not skip_check:
-            problems, infos = self._check_tmc_config(mode)
+            problems, infos = self._check_tmc_config()
             if problems:
-                msg = ("\n=== TMC Configuration Issue(s) for %s mode ===\n"
-                       % mode.upper())
+                msg = "\n=== TMC Configuration Issue(s) ===\n"
                 for fname, val, desc in problems:
                     msg += "Problem: %s (current value: %s)\n%s\n\n" % (
                         fname, val, desc)
@@ -2602,9 +2403,7 @@ new Chart(document.getElementById('sgChart'), {
                         "To skip this check (advanced):\n"
                         "  TMC_FLOW_FIND_MAX SKIP_TMC_CHECK=1")
                 raise gcmd.error(msg)
-            gcmd.respond_info(
-                "TMC configuration check passed for %s mode."
-                % mode.upper())
+            gcmd.respond_info("TMC configuration check passed.")
             for info in infos:
                 gcmd.respond_info(info)
 
@@ -2631,7 +2430,6 @@ new Chart(document.getElementById('sgChart'), {
         sg_label = self._get_sg_label()
         meta = {
             'timestamp': timestamp,
-            'mode': mode.upper(),
             'driver': '%s on %s (%s register, sample rate %.0f Hz)' % (
                 self.driver_type, self.stepper_name, sg_label,
                 1.0 / SAMPLE_INTERVAL),
@@ -2649,13 +2447,8 @@ new Chart(document.getElementById('sgChart'), {
         }
 
         # ─── Banner ───
-        mode_desc = ("SG-only mode (CoolStep disabled, "
-                     "SG abnormal jump + plateau triggers)" if mode == 'sg'
-                     else "CoolStep + SG mode (CoolStep enabled, "
-                     "CS jump/leave/drop + SG backup triggers)")
         gcmd.respond_info(
-            "===== TMC Flow Test v%s — %s mode =====\n"
-            "%s\n"
+            "===== TMC Flow Test v%s =====\n"
             "Range: %.0f → %.0f mm³/s | Coarse: %.0f | Min: %.0f mm³/s\n"
             "Each measurement: %d reps × %.1f s (median over all samples)\n"
             "Cool-down between phases: %.0f s | Hotend: %.1f°C "
@@ -2667,7 +2460,7 @@ new Chart(document.getElementById('sgChart'), {
             "  Phase 2 (Bisection): narrow to ±%.0f mm³/s by halving\n"
             "  Phase 3 (Verification): confirm with %d reps\n"
             "================================================"
-            % (MODULE_VERSION, mode.upper(), mode_desc,
+            % (MODULE_VERSION,
                start_flow, max_flow, coarse_step, min_step,
                repeat, step_duration, cooldown,
                cur_temp, target_temp,
@@ -2680,25 +2473,20 @@ new Chart(document.getElementById('sgChart'), {
         self.gcode.run_script_from_command("M83\nG92 E0")
 
         results = []
-        baseline_cs = None
-        sample_cs = (mode == 'cs')
 
         def measure_and_save(flow, phase):
             r = self._measure_step(
-                gcmd, flow, step_duration, repeat,
-                sample_cs=sample_cs)
+                gcmd, flow, step_duration, repeat)
             r['phase'] = phase
             results.append(r)
             self._save_report(
-                results, meta, timestamp, None, no_html, mode,
+                results, meta, timestamp, None, no_html,
                 gcmd=None, announce=False)
             return r
 
         def check(results):
-            """Dispatch to right trigger function based on mode."""
-            if mode == 'sg':
-                return self._check_triggers_sg(results)
-            return self._check_triggers_cs(results, baseline_cs)
+            """SG-based slip detection."""
+            return self._check_triggers_sg(results)
 
         # ─── PHASE 1: Coarse ───
         gcmd.respond_info(
@@ -2734,13 +2522,6 @@ new Chart(document.getElementById('sgChart'), {
         while flow <= max_flow + 0.001:
             r = measure_and_save(flow, 'coarse')
 
-            # Track baseline CS for CS-mode trigger thresholds
-            if (mode == 'cs' and baseline_cs is None
-                    and r.get('cs') and r['cs']['n'] > 0):
-                cs_med = r['cs']['median']
-                if cs_med < 30:  # not in saturation
-                    baseline_cs = cs_med
-
             reason = check(results)
             if reason:
                 high = flow
@@ -2763,14 +2544,14 @@ new Chart(document.getElementById('sgChart'), {
                 "Reached MAX %.1f mm³/s without trigger. Try MAX higher."
                 % max_flow)
             self._save_report(results, meta, timestamp, None,
-                              no_html, mode, gcmd=gcmd)
+                              no_html, gcmd=gcmd)
             return
 
         if low < start_flow:
             gcmd.respond_info(
                 "Trigger fired on first step (%.1f) — lower START." % high)
             self._save_report(results, meta, timestamp, first_trigger_reason,
-                              no_html, mode, gcmd=gcmd)
+                              no_html, gcmd=gcmd)
             return
 
         # ─── PHASES 2 + 3: Bisection + Verify (with retry) ───
@@ -2893,7 +2674,7 @@ new Chart(document.getElementById('sgChart'), {
                 % (low, verify_repeats))
             verify_result = self._measure_step(
                 gcmd, low, step_duration, verify_repeats,
-                sample_cs=sample_cs)
+                )
             verify_result['phase'] = 'verify'
             results.append(verify_result)
 
@@ -2917,7 +2698,7 @@ new Chart(document.getElementById('sgChart'), {
                     results.pop()
                     verify_result = self._measure_step(
                         gcmd, low, step_duration, verify_repeats,
-                        sample_cs=sample_cs)
+                        )
                     verify_result['phase'] = 'verify'
                     results.append(verify_result)
                     verify_trigger = check(results)
@@ -2975,7 +2756,7 @@ new Chart(document.getElementById('sgChart'), {
                     % (low, verify_repeats))
                 verify_result = self._measure_step(
                     gcmd, low, step_duration, verify_repeats,
-                    sample_cs=sample_cs)
+                    )
                 verify_result['phase'] = 'verify'
                 results.append(verify_result)
                 break
@@ -3026,7 +2807,7 @@ new Chart(document.getElementById('sgChart'), {
                     % (low, verify_repeats))
                 verify_result = self._measure_step(
                     gcmd, low, step_duration, verify_repeats,
-                    sample_cs=sample_cs)
+                    )
                 verify_result['phase'] = 'verify'
                 results.append(verify_result)
                 break
@@ -3044,56 +2825,8 @@ new Chart(document.getElementById('sgChart'), {
         else:
             quality = "poor (high variation — re-run advised)"
 
-        # ─── CoolStep diagnostic (only in CS mode) ───
-        # If CS_ACTUAL stayed pinned at 31 throughout the test, CoolStep
-        # never had a chance to regulate. Per Trinamic AN-002, that
-        # means SG_RESULT was always below SEMIN*32, so SEMIN is set
-        # too high for this motor / load. Recommend a better value.
-        if mode == 'cs':
-            cs_meds = [r['cs']['median'] for r in results
-                       if r.get('cs') and r['cs'].get('n', 0) > 0]
-            sg_meds = [r['sg']['median'] for r in results
-                       if r.get('sg') and r['sg'].get('n', 0) > 0]
-            if (cs_meds and sg_meds
-                    and max(cs_meds) - min(cs_meds) < 1.0
-                    and min(cs_meds) >= 30):
-                sg_max_seen = max(sg_meds)
-                cur_semin = self._read_cs_semin()
-                # AN-002: SEMIN ≈ SG_MAX/4..SG_MAX/8
-                # Lower threshold to ramp current UP is SEMIN*32, so we
-                # want SEMIN*32 to be just above SG_MAX_seen so CoolStep
-                # has room to regulate down when load drops.
-                rec_semin = max(1, int(round(sg_max_seen / 32.0)) + 1)
-                gcmd.respond_info(
-                    "\n----- CoolStep diagnostic -----\n"
-                    "CS_ACTUAL stayed pinned at %.0f for the whole "
-                    "test (range %.1f).\n"
-                    "Your SG_RESULT range was %.0f-%.0f; with "
-                    "driver_SEMIN = %d the CoolStep ramp-up\n"
-                    "threshold is SEMIN*32 = %d, which sits ABOVE "
-                    "every SG value seen — so CoolStep is in\n"
-                    "permanent 'ramp current up' mode and never "
-                    "regulates. Slip detection in this run\n"
-                    "relied on the SG fallback path, which still "
-                    "works fine.\n"
-                    "\n"
-                    "If you want CoolStep to actually regulate (per "
-                    "Trinamic AN-002, SEMIN ≈ SG_MAX/4..SG_MAX/8),\n"
-                    "try in your [%s extruder] section:\n"
-                    "  driver_SEMIN: %d\n"
-                    "  driver_SEMAX: 4\n"
-                    "  driver_SEUP:  3\n"
-                    "  driver_SEDN:  1\n"
-                    "Then FIRMWARE_RESTART and re-run."
-                    % (max(cs_meds),
-                       max(cs_meds) - min(cs_meds),
-                       min(sg_meds), sg_max_seen,
-                       cur_semin, cur_semin * 32,
-                       self.driver_type, rec_semin))
-
         gcmd.respond_info(
             "\n========== FINAL RESULT ==========\n"
-            "Test mode: %s\n"
             "Maximum safe volumetric flow: %.1f mm³/s\n"
             "Verification quality: %s (CV = %.1f%%)\n"
             "----------------------------------\n"
@@ -3103,11 +2836,11 @@ new Chart(document.getElementById('sgChart'), {
             "----------------------------------\n"
             "Detailed data: see CSV/HTML report\n"
             "=================================="
-            % (mode.upper(), max_safe, quality, verify_cv,
+            % (max_safe, quality, verify_cv,
                max_safe * 0.8, max_safe * 0.9))
 
         self._save_report(results, meta, timestamp, last_trigger_reason,
-                          no_html, mode, gcmd=gcmd,
+                          no_html, gcmd=gcmd,
                           final_result={
                               'max_safe': max_safe,
                               'verify_cv': verify_cv,
