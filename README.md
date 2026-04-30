@@ -1,5 +1,4 @@
 # TMC Flow Test
-
 **Adaptive max-volumetric-flow detection for 3D printer extruders using TMC StallGuard.**
 
 Find your extruder's real maximum flow rate automatically — no test prints, no measuring melted noodles. 
@@ -9,6 +8,10 @@ Find your extruder's real maximum flow rate automatically — no test prints, no
 
 Plugin by **Steven (Fragmon) — Crydteam**
 [![YouTube](https://img.shields.io/badge/YouTube-@crydteamprinting-red?logo=youtube)](https://www.youtube.com/@crydteamprinting)
+
+<p align="center">
+  <img src="images/results.png" alt="TMC Flow Test HTML report" width="700">
+</p>
 
 ---
 
@@ -20,7 +23,9 @@ The plugin uses the TMC driver's built-in **StallGuard** load-sensing feature to
 2. **Bisection** — narrow the bracket by halving until the safe value is known to ±1 mm³/s
 3. **Verification** — confirm the safe value with extra repetitions and report a stability metric
 
-Output is a CSV with raw data and an interactive HTML report:
+Output is a CSV with raw data and an interactive HTML report.
+
+Real test on a Sherpa Mini extruder, TMC2240 (StealthChop, run_current 0.85 A):
 
 ```
 ========== FINAL RESULT ==========
@@ -34,6 +39,20 @@ Slicer recommendation:
 ==================================
 ```
 
+Same printer, TMC5160 swapped in (SpreadCycle, run_current 0.85 A):
+
+```
+========== FINAL RESULT ==========
+Test mode: CS
+Maximum safe volumetric flow: 116.0 mm³/s
+Verification quality: excellent (very stable) (CV = 1.1%)
+----------------------------------
+Slicer recommendation:
+  Conservative (80%): 92.8 mm³/s   ← recommended
+  Aggressive (90%):  104.4 mm³/s   ← only with safety margin
+==================================
+```
+
 ---
 
 ## Requirements
@@ -41,19 +60,17 @@ Slicer recommendation:
 - Klipper or Kalico
 - TMC stepper driver on the extruder with StallGuard support:
 
-| Driver  | StallGuard | Chopper required for SG | Tested  |
-| ------- | ---------- | ----------------------- | ------- |
-| TMC2240 | SG4        | StealthChop             | ✅ yes  |
-| TMC2209 | SG4        | StealthChop             | ✅ yes  |
-| TMC5160 | SG2        | SpreadCycle             | ✅ supported (register-direct read) |
-| TMC2130 / TMC2660 | SG2 | SpreadCycle           | register-direct read (untested) |
-| TMC2208 / TMC2226 | SG4 | StealthChop           | fallback |
+| Driver  | StallGuard | Required chopper mode for the test       | Tested |
+| ------- | ---------- | ---------------------------------------- | ------ |
+| TMC2240 | SG4 / SG2  | StealthChop (SG4) **or** SpreadCycle (SG2) | ✅ SG4 path tested (Sherpa Mini, ~57 mm³/s) |
+| TMC2209 | SG4        | StealthChop only                         | ✅ tested  |
+| TMC5160 | SG2        | SpreadCycle (only mode SG2 works in)     | ✅ tested (Sherpa Mini, ~117 mm³/s) |
+| TMC2130 | SG2        | SpreadCycle                              | code path present, untested |
+| TMC2660 | SG2        | SpreadCycle                              | code path present, untested |
+| TMC2208 / TMC2226 | — | (no StallGuard; not supported)         | not supported |
 
-- **The right chopper mode for your driver must be active** for the test:
-  - **SG4 drivers** (TMC2240, TMC2209) → **StealthChop** required
-  - **SG2 drivers** (TMC5160, TMC2130, TMC2660) → **SpreadCycle** required
+**The TMC2240 is special**: it has both StallGuard4 AND StallGuard2 on-chip. The plugin works in either mode — see [the chopper mode section](#-important-chopper-mode-required-for-stallguard) below for details. SG2/SpreadCycle is the `klipper_tmc_autotune` default and the more practical choice for printing.
 
-  See [the StealthChop section](#-important-stealthchop-required-for-stallguard) below
 - Hotend at print temperature
 
 ---
@@ -90,19 +107,23 @@ Test takes ~10 minutes by default. CSV and HTML report are saved to `~/printer_d
 
 ## How it works
 
-The plugin reads StallGuard (`SG_RESULT` / `SG4_RESULT`) and CoolStep current scale (`CS_ACTUAL`) at 20 Hz during extrusion. It detects slip via several triggers:
+The plugin reads StallGuard (`SG_RESULT` / `SG4_RESULT`) and CoolStep current scale (`CS_ACTUAL`) at 20 Hz during extrusion. Slip detection uses three independent triggers — any one fires:
 
-**SG-only mode** (when `driver_SEMIN: 0`):
-- SG abnormal jump: actual increase > 2× expected AND > +15
-- SG plateau over 2 steps: cumulative rise < 0.5× expected (motor turning but no longer pushing more filament)
+**1. Reload jump (snap-back).** During normal extrusion the SG signal trends in one direction with rising flow. When the motor decouples (slip), SG snaps sharply back toward its no-load value. The plugin learns the trend direction from the recent steps so this works for both SG2 (SG falls with load) and SG4 (SG often rises with load on extruders).
 
-**CoolStep + SG mode** (when `driver_SEMIN > 0`):
+**2. Abnormal jump.** SG moves in the trend direction, but much faster than the typical step (>2× expected, with a minimum jump size). Indicates a sudden over-acceleration of the load signal — typical SG4 slip pattern.
+
+**3. CV spike (intermittent slip).** Run-to-run variance jumps from baseline (~3 %) to ≥10 % AND ≥2× the recent average. This catches the **earliest** slip onset, where individual repeats start diverging before the median itself moves. Often fires one full coarse step before the snap-back/abnormal-jump triggers do.
+
+In CoolStep mode (`driver_SEMIN > 0`), three additional CS-based triggers run alongside:
+
 - CS_ACTUAL jumps up ≥+5: sudden load increase
 - CS_ACTUAL leaves regulation range: approaching slip
 - CS_ACTUAL drops sharply: motor lost load contact (hard stall)
-- SG abnormal jump: backup detection
 
-Both modes use median + IQR statistics over 5 repetitions per measurement (configurable) to filter out single-cycle noise. The first run is excluded as warmup if it deviates more than 10% from the rest (filament pressure buildup).
+If CoolStep is configured but `CS_ACTUAL` stays pinned at 31 throughout the test (because `SEMIN` is too high for the SG range your motor produces), the plugin falls back to the SG triggers above and prints a CoolStep diagnostic with a recommended `SEMIN` value at the end.
+
+All triggers use median + IQR statistics over 5 repetitions per measurement (configurable) to filter single-cycle noise. The first run is excluded as warmup if it deviates more than 10 % from the rest (filament pressure buildup).
 
 ---
 
@@ -114,7 +135,7 @@ Pick the variant matching your driver and CoolStep preference. **Run the test wi
 
 > ⚠️ **Adapt before pasting:** Lines marked with `# ADAPT` depend on your specific board, wiring and motor. Don't copy these blocks blindly — at minimum, set the right pins and current for your hardware. The other lines (StallGuard / CoolStep settings) are required by the plugin and should be kept as shown.
 
-#### TMC2240, CoolStep enabled (klipper_tmc_autotune default)
+#### TMC2240, CoolStep enabled (SG4/StealthChop path — what the plugin currently checks for)
 
 ```ini
 [tmc2240 extruder]
@@ -198,15 +219,19 @@ hold_current: 0.6                # ADAPT: typically 60–70% of run_current
 sense_resistor: 0.075            # ADAPT: matches your TMC5160 module (typical 0.075 Ω)
 interpolate: false               # required for clean SG readings
 # IMPORTANT: TMC5160 uses StallGuard2, which only works in SpreadCycle.
-# Do NOT set stealthchop_threshold (or set it to 0) so the driver always
-# uses SpreadCycle.
-#stealthchop_threshold: 0
+# Klipper's default IS SpreadCycle (en_pwm_mode=0, tpwmthrs=0xFFFFF).
+# DO NOT add a `stealthchop_threshold:` line here. In particular,
+# `stealthchop_threshold: 0` does NOT disable StealthChop — it actually
+# enables StealthChop with a velocity threshold of 0, which breaks
+# StallGuard2.
 coolstep_threshold: 0.5          # required: enables StallGuard reading above this velocity
-driver_SEMIN: 5                  # required for CoolStep mode (must be > 0)
-driver_SEMAX: 2                  # CoolStep upper threshold
-driver_SEUP: 2
-driver_SEDN: 1
-driver_SEIMIN: 1
+# CoolStep tunables — values below are SG2-tuned (see note after next block).
+# For SG4 drivers (TMC2240/2209) use SEMIN: 5, SEMAX: 2 instead.
+driver_SEMIN: 2                  # SG2 typical: SG_MAX/4..SG_MAX/8 (here ≈ SG_MAX/30)
+driver_SEMAX: 4                  # gives a wide CoolStep hysteresis band
+driver_SEUP: 3                   # fastest current-up step
+driver_SEDN: 1                   # slow current-down (good for noisy SG2)
+driver_SEIMIN: 1                 # min current = 1/2 IRUN when CoolStep regulates down
 ```
 
 #### TMC5160, CoolStep disabled
@@ -220,10 +245,19 @@ run_current: 0.85                # ADAPT
 hold_current: 0.6                # ADAPT
 sense_resistor: 0.075            # ADAPT
 interpolate: false               # required
-#stealthchop_threshold: 0        # SpreadCycle is required for SG2
+# IMPORTANT: do NOT add `stealthchop_threshold:` — see TMC5160 CoolStep
+# enabled section above for why. Klipper's default is SpreadCycle-only.
 coolstep_threshold: 0.5          # required
 driver_SEMIN: 0                  # required for SG-only mode (CoolStep disabled)
 ```
+
+#### A note on driver_SEMIN for SG2 drivers (TMC5160 / TMC2130 / TMC2660)
+
+The example above already uses `driver_SEMIN: 2`, which is appropriate for typical extruder loads on SG2 drivers. **If you copied your config from XY-stepper templates, you probably have `SEMIN: 5` instead — and that's almost always too high for an extruder.**
+
+CoolStep ramps current **up** when `SG_RESULT < SEMIN × 32`. For `SEMIN = 5` that means SG below 160. SG2 drivers on extruders typically produce SG values in the 20–80 range, so CoolStep stays in permanent ramp-up mode and `CS_ACTUAL` sticks at 31 (max current). The plugin still detects slip correctly via the SG fallback path, and prints a diagnostic at the end of the test recommending a fitted SEMIN for your hardware.
+
+Per Trinamic AN-002 the rule of thumb is `SEMIN ≈ SG_MAX / 4 .. SG_MAX / 8`. For typical extruder SG_MAX of 60–80, **`driver_SEMIN: 2`** (= threshold 64) is a much better starting point than 5 (= threshold 160). Adjust after your first test run based on the diagnostic output.
 
 #### Pin reference: where to find your values
 
@@ -292,14 +326,20 @@ melt_zone_length: 42             # ADAPT: hotend melt-zone length in mm (Sherpa 
 ---
 ## ⚠️ Important: chopper mode required for StallGuard
 
-This plugin needs the **right chopper mode** for your driver. This is a hardware limitation of the TMC chips, not the plugin:
+This plugin needs the **right chopper mode** for your driver. This is a hardware property of the TMC chips, not the plugin:
 
-- **TMC2240 / TMC2209**: use **StallGuard4**, which works only in **StealthChop** ([source: Trinamic AN-002](https://www.analog.com/en/resources/app-notes/an-002.html))
-- **TMC5160 / TMC2130 / TMC2660**: use **StallGuard2**, which works only in **SpreadCycle**
+- **TMC2209**: uses **StallGuard4 only**, which works only in **StealthChop**. SpreadCycle does not produce usable SG values during continuous extrusion. (Klipper temporarily switches modes during sensorless homing — that does not help here.)
+- **TMC5160 / TMC2130 / TMC2660**: use **StallGuard2 only**, which works only in **SpreadCycle**. (This is also Klipper's default — usually you don't need to do anything.)
+- **TMC2240**: special case — has **both** StallGuard4 and StallGuard2 on-chip. Works in either mode:
+  - StealthChop + `sg4_thrs` non-zero → SG4 path (the plugin currently treats this as the SG4 case)
+  - SpreadCycle + `sg4_thrs = 0` → SG2 path (this is the `klipper_tmc_autotune` default for the TMC2240 and the more practical configuration for printing)
 
-Klipper's default for all TMC drivers is **SpreadCycle**. That's the right default for SG2 drivers (TMC5160/2130/2660) but the **wrong** default for SG4 drivers (TMC2240/2209) — many printer profiles (Voron, RatRig, etc.) keep that default on the extruder for higher torque. **For SG4 drivers in that default state, the plugin won't work** — it will report `SG median = n/a` or fail the config check with `stealthchop_threshold` warnings.
+### ⚠️ TMC5160 / TMC2130 / TMC2660: don't add `stealthchop_threshold`
 
-**For TMC5160:** the plugin's config check expects `stealthchop_threshold` to be unset or 0 — i.e. SpreadCycle always on. If you've added `stealthchop_threshold: 999999` to a TMC5160 section, remove it before running the test.
+These drivers need pure SpreadCycle. Klipper's default already gives you that — **do not add a `stealthchop_threshold:` line at all** for SG2 drivers.
+
+> **`stealthchop_threshold: 0` is NOT the same as "no line".**
+> The presence of any `stealthchop_threshold` value (including `0`) tells Klipper to enable StealthChop. With `0` it does so with a velocity threshold of 0, meaning StealthChop is active at all speeds, which breaks StallGuard2. If you previously added `stealthchop_threshold: 0` or `stealthchop_threshold: 999999` to an SG2 driver section, **remove the entire line** and `FIRMWARE_RESTART`.
 
 ### How do I know which mode I'm in?
 
@@ -313,13 +353,14 @@ Look at the output:
 
 - For **TMC2240**: line `en_pwm_mode=1` means StealthChop, `en_pwm_mode=0` means SpreadCycle
 - For **TMC2209**: line `en_spreadCycle=0` means StealthChop, `en_spreadCycle=1` means SpreadCycle
+- For **TMC5160 / TMC2130 / TMC2660**: should always show `en_pwm_mode=0` (SpreadCycle); `tpwmthrs=1048575` (= `0xFFFFF`) is Klipper's default and means StealthChop is permanently disabled — that's correct
 - All drivers: if `tpwmthrs` is mid-range (not 0 and not 0xFFFFF), the driver switches modes based on speed — that's a problem for the test
 
 You can also just run `TMC_FLOW_STATUS` — the plugin checks all of this and reports any issues.
 
-### What if my extruder is on SpreadCycle?
+### What if my SG4 extruder is on SpreadCycle?
 
-You have three options:
+(This applies only to TMC2209 and TMC2240 with SG4 path.) You have three options:
 
 #### Option 1 — Switch your extruder to StealthChop permanently (recommended)
 
@@ -338,9 +379,13 @@ Then `FIRMWARE_RESTART`. The `999999` value means "always use StealthChop, regar
 
 For most extruders below ~50 mm³/s, StealthChop works fine and is what `klipper_tmc_autotune` recommends by default. Try it on a calibration print before your next big print.
 
-#### Option 2 — Switch only for the test, then back
+#### Option 2 — On TMC2240: just stay on SpreadCycle and use SG2
 
-If you really want to keep SpreadCycle for printing but still run this test:
+The TMC2240 has both engines. If you're already configured for SpreadCycle with `klipper_tmc_autotune` (which sets `sg4_thrs = 0`), the plugin will work via the SG2 path — no config change needed.
+
+#### Option 3 — Switch only for the test, then back
+
+If you really want to keep SpreadCycle for printing on a TMC2209 (which only has SG4) but still run this test:
 
 ```
 # Before the test:
@@ -359,9 +404,9 @@ SET_TMC_FIELD STEPPER=extruder FIELD=en_spreadCycle VALUE=1
 
 **⚠️ Caveat:** The result will reflect the StealthChop max flow, not your normal SpreadCycle behaviour. Expect the actual SpreadCycle limit to be **5–15% higher** than what the test reports, because SpreadCycle delivers more torque at high speeds. Use the test value as a conservative lower bound.
 
-#### Option 3 — Don't use this plugin
+#### Option 4 — Don't use this plugin
 
-If your extruder absolutely needs SpreadCycle (very high-flow setups, specific motor characteristics), this plugin isn't the right tool. Stick to traditional flow tower prints — they don't depend on chopper mode.
+If your SG4 extruder absolutely needs SpreadCycle (very high-flow setups, specific motor characteristics), this plugin isn't the right tool for that driver. Stick to traditional flow tower prints — they don't depend on chopper mode.
 
 ---
 
@@ -410,8 +455,8 @@ The config check will fail if the forced mode doesn't match your `driver_SEMIN` 
 # Standard test (10–80 mm³/s, ~10 minutes)
 TMC_FLOW_FIND_MAX
 
-# Higher flow range for fast extruders
-TMC_FLOW_FIND_MAX MAX=120 START=20
+# Higher flow range for fast extruders (TMC5160 setups regularly need this)
+TMC_FLOW_FIND_MAX MAX=150 START=20
 
 # Quicker, less accurate
 TMC_FLOW_FIND_MAX REPEAT=3 VERIFY_REPEATS=3 COOLDOWN=30
@@ -436,11 +481,12 @@ tmc_flow_<mode>_YYYY-MM-DD_HH-MM-SS.html    ← interactive report
 
 The HTML report renders in any browser and includes:
 
+- **Prominent result panel** at the top: maximum safe flow as a large number, verification quality (CV%), and slicer recommendations (80% / 90%)
 - **SG vs. flow chart** with median + IQR (P25/P75) and average
 - **CS_ACTUAL vs. flow chart** (CoolStep mode only)
 - **Phase markers** — vertical dashed lines at Coarse → Bisection → Verify transitions
 - **Data table** with inter-run consistency (CV) for each measurement
-- **Stop reason** (which trigger fired and at which flow)
+- **Stop reason** (which trigger fired and at which flow), shown below the result panel
 
 ---
 
@@ -454,7 +500,9 @@ CoolStep dynamically adjusts motor current based on load. Lower current at idle/
 
 This is what `klipper_tmc_autotune` enables by default for extruders.
 
-The test detects slip via CS_ACTUAL transitions (current scale changes) and SG as backup.
+The test detects slip via CS_ACTUAL transitions (current scale changes) when CoolStep is actively regulating, and via SG signal patterns as backup.
+
+> **Note for SG2 drivers (TMC5160, TMC2130, TMC2660):** SG_RESULT values on these drivers tend to be much lower (typically 30–100) than on SG4 drivers, so a SEMIN value copied from XY-stepper examples (often 5) leaves CoolStep permanently in "ramp current up" mode and CS stays pinned at 31. The plugin handles this correctly — it auto-detects the static CS and uses the SG-based triggers instead. Result is identical, just via a different code path. The final report includes a CoolStep diagnostic with a recommended SEMIN tuned to your hardware. See the [CS_ACTUAL stays pinned at 31 troubleshooting entry](#cs_actual-stays-pinned-at-31-throughout-the-test).
 
 ### CoolStep disabled (`driver_SEMIN = 0`)
 
@@ -474,9 +522,15 @@ Configure your driver the way you always print, then run `TMC_FLOW_FIND_MAX`. Th
 
 ### "StealthChop is not active. StallGuard needs StealthChop ON."
 
-Your `[tmcXXXX extruder]` section is missing `stealthchop_threshold: 999999` (or it's set to a low value that disables StealthChop at higher speeds). See [the StealthChop section](#-important-stealthchop-required-for-stallguard) for the full explanation and three options to fix it.
+(SG4 drivers only — TMC2209 and TMC2240 in SG4 mode.) Your `[tmc2209 extruder]` or `[tmc2240 extruder]` section is missing `stealthchop_threshold: 999999` (or it's set to a low value that disables StealthChop at higher speeds). See [the chopper mode section](#-important-chopper-mode-required-for-stallguard) for the full explanation and options to fix it.
 
 Quickest fix: add `stealthchop_threshold: 999999` to your extruder TMC section and `FIRMWARE_RESTART`.
+
+### "TMC5160 / TMC2130 StallGuard2 needs SpreadCycle..."
+
+(SG2 drivers only.) Your `[tmc5160 extruder]` (or 2130/2660) section has `stealthchop_threshold:` set, which enables StealthChop and breaks StallGuard2. **Remove the entire `stealthchop_threshold:` line** from the section — Klipper's default is already pure SpreadCycle. Then `FIRMWARE_RESTART`.
+
+> Common pitfall: setting `stealthchop_threshold: 0` does NOT disable StealthChop. Any value (including 0) enables it. The line must be removed entirely.
 
 ### "Unable to read tmc uart 'extruder' register IFCNT"
 
@@ -489,7 +543,7 @@ UART communication with the TMC2209 isn't working. Not a plugin issue — Klippe
 
 ### "sg4_thrs is 0. StallGuard trigger inactive."
 
-The `delayed_gcode setup_extruder_sg` block is missing or didn't run. Check that it's in your `printer.cfg` and run `FIRMWARE_RESTART`.
+(SG4 drivers only.) The `delayed_gcode setup_extruder_sg` block is missing or didn't run. Check that it's in your `printer.cfg` and run `FIRMWARE_RESTART`.
 
 For a quick test, set it manually in the console:
 
@@ -498,23 +552,35 @@ SET_TMC_FIELD STEPPER=extruder FIELD=sg4_thrs VALUE=80
 SET_TMC_FIELD STEPPER=extruder FIELD=sg4_filt_en VALUE=1
 ```
 
-(For TMC2209: `FIELD=sgthrs VALUE=100` and skip the filter line.)
+(For TMC2209: `FIELD=sgthrs VALUE=100` and skip the filter line. SG2 drivers don't need this — the plugin reads SG_RESULT directly from `DRV_STATUS`.)
 
 ### "SG median = n/a" during the test
 
-The most common cause: your extruder is in **SpreadCycle** mode, not StealthChop. StallGuard4 (TMC2240/TMC2209) only works in StealthChop. See [the StealthChop section above](#-important-stealthchop-required-for-stallguard) for how to fix this.
+For **SG4 drivers** (TMC2240, TMC2209): the most common cause is that the extruder is in **SpreadCycle** mode instead of StealthChop. See [the chopper mode section above](#-important-chopper-mode-required-for-stallguard).
 
-Other possible causes:
-- Plugin is older than the register-direct-read version — make sure you're on the latest from this repo (the plugin must read SG/CS directly from the driver registers, not via `get_status()`)
+For **SG2 drivers** (TMC5160, TMC2130, TMC2660): SG_RESULT comes from `DRV_STATUS` and depends on `coolstep_threshold` (`tcoolthrs`) being set so StallGuard reads above a minimum velocity. Check that `coolstep_threshold: 0.5` (or similar low value) is set in your TMC section.
+
+Other possible causes (any driver):
+- Plugin older than the register-direct-read version — make sure you're on the latest from this repo
 - TMC driver isn't responding at all — run `DUMP_TMC STEPPER=extruder` to verify communication
+
+### CS_ACTUAL stays pinned at 31 throughout the test
+
+This is **not** a plugin bug — it means CoolStep can't regulate because all SG values are below the lower threshold (`SEMIN × 32`). It's especially common on TMC5160 / TMC2130 / TMC2660 (SG2 drivers), where SG values are typically much lower (30–100 range) than on SG4.
+
+The test still works correctly: when CS is static, the plugin auto-detects this and falls back to the SG-based triggers. After the test, you'll see a CoolStep diagnostic in the console with a recommended SEMIN value tuned to your hardware. Per Trinamic AN-002, `SEMIN ≈ SG_MAX/4..SG_MAX/8`.
+
+Typical fix for SG2 drivers: lower `driver_SEMIN` from 5 (a common XY-stepper default) to 2 or 3, raise `driver_SEMAX` to 4. See the [TMC5160 CoolStep enabled config example](#tmc5160-coolstep-enabled) above.
 
 ### Reached MAX without trigger
 
 Your extruder is faster than the default `MAX=80`. Try:
 
 ```
-TMC_FLOW_FIND_MAX MAX=120
+TMC_FLOW_FIND_MAX MAX=150
 ```
+
+(TMC5160 setups regularly reach 100–130 mm³/s.)
 
 ### Trigger fires immediately at START
 
@@ -531,6 +597,7 @@ TMC_FLOW_FIND_MAX START=5 COARSE_STEP=5
 - Increase `COOLDOWN` between phases (e.g. 90 s) to fully release hotend pressure
 - Make sure the hotend is at exact target temp (`M109 S230`)
 - Check that the filament feed path is clean and consistent
+- Use a smaller `COARSE_STEP` (e.g. 10 instead of 20) — bigger steps give the CV-spike trigger less context to work with
 
 ---
 
@@ -553,6 +620,13 @@ YouTube: [@crydteamprinting](https://www.youtube.com/@crydteamprinting)
 Released under the GNU General Public License v3.0. See [LICENSE](LICENSE) for details.
 
 Inspired by Klipper's StallGuard implementation and the work of the [klipper_tmc_autotune](https://github.com/andrewmcgr/klipper_tmc_autotune) project.
+
+---
+
+## Roadmap
+
+- **TMC2240 SG2/SpreadCycle path**: the chip supports both StallGuard engines on-chip. The plugin currently expects the SG4/StealthChop combination; users running `klipper_tmc_autotune` (default `sg4_thrs = 0` → SpreadCycle/SG2) need to either configure StealthChop manually for the test, or wait for the dedicated SG2 path on the TMC2240 (in progress).
+- Confirmed-tested markers for TMC2130 / TMC2660 (code path present, awaiting reports from users with that hardware).
 
 ---
 
