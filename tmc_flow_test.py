@@ -46,6 +46,10 @@ class TMCFlowTest:
         self.driver_type = None   # 'tmc2240', 'tmc2209', 'tmc5160', etc.
         self.is_2240 = False
         self.is_2209 = False
+        self.is_5160 = False
+        # SG2 family (TMC5160, TMC2130, TMC2660) — StallGuard2 in SpreadCycle,
+        # SG_RESULT in DRV_STATUS bits 0-9, threshold field 'sgt' (signed).
+        self.sg2_driver = False
         self.sg4_available = False  # SG4_RESULT register (TMC2240)
 
         # Sample buffers
@@ -91,6 +95,8 @@ class TMCFlowTest:
                 self.driver_type = drv
                 self.is_2240 = (drv == 'tmc2240')
                 self.is_2209 = (drv == 'tmc2209')
+                self.is_5160 = (drv == 'tmc5160')
+                self.sg2_driver = drv in ('tmc5160', 'tmc2130', 'tmc2660')
                 # Check for SG4_RESULT register (TMC2240 only)
                 try:
                     self.sg4_available = (
@@ -100,8 +106,9 @@ class TMCFlowTest:
                     self.sg4_available = False
                 logging.info(
                     "tmc_flow_test: using %s for stepper '%s' "
-                    "(SG4=%s, is_2209=%s)",
-                    drv, self.stepper_name, self.sg4_available, self.is_2209)
+                    "(SG4=%s, is_2209=%s, sg2=%s)",
+                    drv, self.stepper_name, self.sg4_available,
+                    self.is_2209, self.sg2_driver)
                 return
         raise self.gcode.error(
             "tmc_flow_test: no TMC driver found for stepper '%s'."
@@ -113,7 +120,10 @@ class TMCFlowTest:
         """Return the correct SG-threshold field name for this driver."""
         if self.is_2240:
             return 'sg4_thrs'
-        # TMC2209, TMC2226, TMC5160 (sgt), etc. use 'sgthrs'
+        if self.sg2_driver:
+            # TMC5160 / TMC2130 / TMC2660 — StallGuard2 threshold (signed)
+            return 'sgt'
+        # TMC2209, TMC2226, TMC2208 use 'sgthrs'
         return 'sgthrs'
 
     def _get_sg_label(self):
@@ -151,38 +161,60 @@ class TMCFlowTest:
         sg_thrs_field = self._get_sg_threshold_field_name()
         sg_thrs_val = get(sg_thrs_field)
 
-        # ─── StealthChop check (driver-specific) ───
-        # TMC2240: en_pwm_mode = 1 means StealthChop enabled
-        # TMC2209: en_spreadCycle = 0 means StealthChop enabled
-        stealthchop_active = True
-        stealthchop_indicator = None
-        if self.is_2240:
-            if en_pwm_mode is not None:
-                stealthchop_active = (en_pwm_mode == 1)
-                stealthchop_indicator = ('en_pwm_mode', en_pwm_mode, 'should be 1')
-        elif self.is_2209:
-            if en_spread_cycle is not None:
-                stealthchop_active = (en_spread_cycle == 0)
-                stealthchop_indicator = ('en_spreadCycle', en_spread_cycle,
-                                         'should be 0')
+        # ─── Chopper-mode check (driver-specific) ───
+        # SG4 family (TMC2240, TMC2209): StallGuard4 needs StealthChop ON
+        # SG2 family (TMC5160, TMC2130, TMC2660): StallGuard2 needs SpreadCycle
+        if self.is_2240 or self.is_2209:
+            stealthchop_active = True
+            stealthchop_indicator = None
+            if self.is_2240:
+                if en_pwm_mode is not None:
+                    stealthchop_active = (en_pwm_mode == 1)
+                    stealthchop_indicator = (
+                        'en_pwm_mode', en_pwm_mode, 'should be 1')
+            elif self.is_2209:
+                if en_spread_cycle is not None:
+                    stealthchop_active = (en_spread_cycle == 0)
+                    stealthchop_indicator = (
+                        'en_spreadCycle', en_spread_cycle, 'should be 0')
 
-        if not stealthchop_active and stealthchop_indicator:
-            problems.append(
-                (stealthchop_indicator[0], stealthchop_indicator[1],
-                 'StealthChop is not active. StallGuard needs StealthChop '
-                 'ON.\n'
-                 'Add to your [%s extruder] section:\n'
-                 '  stealthchop_threshold: 999999' % self.driver_type))
-        elif (tpwmthrs is not None and tpwmthrs > 0
-              and tpwmthrs < 0x10000):
-            # Mid-range tpwmthrs would switch to SpreadCycle at higher speeds
-            problems.append(
-                ('tpwmthrs', tpwmthrs,
-                 'StealthChop only active below a velocity threshold '
-                 '(tpwmthrs=%d). At higher flows the driver switches to '
-                 'SpreadCycle and breaks StallGuard.\n'
-                 'Set:\n'
-                 '  stealthchop_threshold: 999999' % tpwmthrs))
+            if not stealthchop_active and stealthchop_indicator:
+                problems.append(
+                    (stealthchop_indicator[0], stealthchop_indicator[1],
+                     'StealthChop is not active. StallGuard4 needs '
+                     'StealthChop ON.\n'
+                     'Add to your [%s extruder] section:\n'
+                     '  stealthchop_threshold: 999999' % self.driver_type))
+            elif (tpwmthrs is not None and tpwmthrs > 0
+                  and tpwmthrs < 0x10000):
+                # Mid-range tpwmthrs would switch to SpreadCycle at higher
+                # speeds.
+                problems.append(
+                    ('tpwmthrs', tpwmthrs,
+                     'StealthChop only active below a velocity threshold '
+                     '(tpwmthrs=%d). At higher flows the driver switches '
+                     'to SpreadCycle and breaks StallGuard4.\n'
+                     'Set:\n'
+                     '  stealthchop_threshold: 999999' % tpwmthrs))
+        elif self.sg2_driver:
+            # TMC5160 / TMC2130 / TMC2660 — SG2 requires SpreadCycle.
+            if en_pwm_mode is not None and en_pwm_mode == 1:
+                problems.append(
+                    ('en_pwm_mode', en_pwm_mode,
+                     'StealthChop is active. %s StallGuard2 only works in '
+                     'SpreadCycle mode.\n'
+                     'Remove (or set to 0) in your [%s extruder] section:\n'
+                     '  stealthchop_threshold: 0'
+                     % (self.driver_type.upper(), self.driver_type)))
+            elif tpwmthrs is not None and tpwmthrs > 0:
+                problems.append(
+                    ('tpwmthrs', tpwmthrs,
+                     '%s StallGuard2 needs SpreadCycle at all speeds, but '
+                     'tpwmthrs=%d enables StealthChop below that velocity.\n'
+                     'Remove stealthchop_threshold from your [%s extruder] '
+                     'section (or set it to 0).'
+                     % (self.driver_type.upper(), tpwmthrs,
+                        self.driver_type)))
 
         # ─── tcoolthrs check (StallGuard gate) ───
         if tcoolthrs == 0:
@@ -193,7 +225,10 @@ class TMCFlowTest:
                  '  coolstep_threshold: 0.5' % self.driver_type))
 
         # ─── SG threshold check ───
-        if sg_thrs_val == 0:
+        # Only enforced for SG4 family. For SG2 (TMC5160/2130/2660), sgt is
+        # signed (-64..63) and SG_RESULT can be read regardless of sgt; we
+        # don't depend on the hardware stop trigger.
+        if (self.is_2240 or self.is_2209) and sg_thrs_val == 0:
             problems.append(
                 (sg_thrs_field, sg_thrs_val,
                  '%s is 0. StallGuard trigger inactive.\n'
@@ -255,6 +290,11 @@ class TMCFlowTest:
             infos.append(
                 "Driver: TMC2240 detected (uses SG4_RESULT, sg4_thrs, "
                 "sg4_filt_en).")
+        elif self.sg2_driver:
+            infos.append(
+                "Driver: %s detected (StallGuard2 in SpreadCycle, "
+                "SG_RESULT via DRV_STATUS, sgt threshold)."
+                % self.driver_type.upper())
 
         return (problems, infos)
 
@@ -265,6 +305,7 @@ class TMCFlowTest:
 
         TMC2240: SG4_RESULT register
         TMC2209: SG_RESULT register
+        TMC5160 / TMC2130 / TMC2660: DRV_STATUS bits 0-9 (SG_RESULT)
         Other drivers: fallback via get_status()
         """
         reg_name = None
@@ -281,7 +322,18 @@ class TMCFlowTest:
                 logging.debug(
                     "tmc_flow_test: %s read failed: %s", reg_name, e)
                 return None
-        # Fallback for other drivers (TMC5160 / TMC2130 / etc.)
+
+        # TMC5160 / TMC2130 / TMC2660: SG_RESULT lives in DRV_STATUS bits 0-9
+        if self.sg2_driver:
+            try:
+                reg_val = self.tmc.mcu_tmc.get_register('DRV_STATUS')
+                return reg_val & 0x3FF
+            except Exception as e:
+                logging.debug(
+                    "tmc_flow_test: DRV_STATUS read failed: %s", e)
+                return None
+
+        # Fallback for any other unknown driver
         try:
             drv = self.tmc.get_status(self.reactor.monotonic())
             if 'drv_status' in drv and isinstance(drv['drv_status'], dict):
@@ -294,9 +346,9 @@ class TMCFlowTest:
         """Read CS_ACTUAL directly from DRV_STATUS register.
 
         Bits 16-20 of DRV_STATUS = CS_ACTUAL (5 bits, range 0-31).
-        Same layout on TMC2240 and TMC2209.
+        Same layout on TMC2240, TMC2209, TMC5160 / TMC2130 / TMC2660.
         """
-        if self.is_2240 or self.is_2209:
+        if self.is_2240 or self.is_2209 or self.sg2_driver:
             try:
                 reg_val = self.tmc.mcu_tmc.get_register('DRV_STATUS')
                 return (reg_val >> 16) & 0x1F
@@ -337,7 +389,7 @@ class TMCFlowTest:
         # For drivers we read directly from registers, accept any non-None
         # value (including 0). For fallback drivers via get_status, we
         # filter 0/None as those usually mean "not yet polled".
-        direct_read = self.is_2240 or self.is_2209
+        direct_read = self.is_2240 or self.is_2209 or self.sg2_driver
         if sg is not None:
             if direct_read or sg > 0:
                 self.samples_sg.append(sg)
