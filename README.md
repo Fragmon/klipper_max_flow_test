@@ -17,11 +17,12 @@ Plugin by **Steven (Fragmon) — Crydteam**
 
 ## What it does
 
-The plugin reads the TMC driver's **StallGuard** load signal during extrusion to detect when the motor is approaching slip. It runs a three-phase test:
+The plugin reads the TMC driver's **StallGuard** load signal during extrusion to detect when the motor is approaching slip. It runs a four-phase test:
 
-1. **Coarse sweep** — flow rises in big steps until StallGuard sees the limit approach
-2. **Bisection** — the safe value is narrowed to ±1 mm³/s; borderline measurements are auto-re-tested
-3. **Verification** — final value is confirmed with extra repeats and a stability metric; if verify fails, the test drops back into bisection with a tighter bracket
+1. **Auto-SGT calibration** *(optional, on by default)* — probes SG_RESULT at the start flow and adjusts `driver_SGT` to land in the optimal sensitivity range
+2. **Coarse sweep** — flow rises in big steps until StallGuard sees the limit approach
+3. **Bisection** — the safe value is narrowed to ±1 mm³/s; borderline measurements are auto-re-tested
+4. **Verification** — final value is confirmed with extra repeats and a stability metric; if verify fails, the test drops back into bisection with a tighter bracket
 
 Output: a CSV with raw data and an interactive HTML report with a **decision trail** (every trigger that fired, why, and which value defined the result).
 
@@ -41,32 +42,38 @@ Output: a CSV with raw data and an interactive HTML report with a **decision tra
 4. **Heat your hotend** to printing temperature, load filament.
 5. Run:
    ```
-   TMC_FLOW_FIND_MAX MAX=150 START=20
+   TMC_FLOW_FIND_MAX MAX=150 START=10
    ```
 
-Test takes ~10 minutes (+30–60 s if borderline measurements need re-testing). CSV and HTML report land in `~/printer_data/config/Flowtest/`.
+Test takes ~10–13 minutes total: ~1–2 min for Auto-SGT calibration plus ~10 min for the actual sweep. Add 30–60 s if borderline measurements need re-testing. CSV and HTML report land in `~/printer_data/config/Flowtest/`.
 
 ---
 
-## Before you run: SG range check
+## Auto-SGT calibration
 
-The plugin only works well when StallGuard produces a **usable signal range**. Run `TMC_FLOW_STATUS` first to see the current SG value, then run a short test and watch the SG values printed in the Klipper console.
+The biggest factor in StallGuard accuracy is the `driver_SGT` setting. Set it too high and SG saturates at 1023 (no useful range). Set it too low and SG hits the noise floor before the motor actually slips.
 
-| Driver | Sensitivity field | Healthy SG range across the sweep |
-|---|---|---|
-| TMC5160 / TMC2240 / TMC2130 (SG2) | `driver_SGT` | low load: ~400–600, near slip: ~50–150 |
-| TMC2209 (SG4) | `driver_SGTHRS` | low load: ~300–500, near slip: ~50–150 |
+The plugin's **Auto-SGT** phase (on by default) handles this for you:
 
-You want **at least 200 raw SG units** of dynamic range between low-load and high-load, with neither end saturated (0 or 1023).
+1. Reads your current `driver_SGT` value
+2. Probes SG_RESULT at the test's `START` flow (5 reps × 5 s, like the main test)
+3. If saturation is detected (any sample at 1023) → lowers SGT
+4. If SG is too low (median < 600) → raises SGT
+5. Iterates until SG sits in the healthy 600–1022 range
+6. Runs the actual flow test with the tuned SGT
+7. **Restores your original SGT after the test** (unless `KEEP_SGT=1` is passed)
 
-**SG too low** (median <50, often saturating at 0):
-- SG2 drivers (TMC5160 / TMC2240 / TMC2130): raise `driver_SGT` (e.g. +5 to +10)
-- TMC2209: lower `driver_SGTHRS` (e.g. by 20)
+The console output recommends the tuned value for permanent inclusion in `printer.cfg`:
 
-**SG too high** (often saturating at 1023): opposite of above.
+```
+Auto-SGT: tuned to SGT=13 (was 18).
+→ For a permanent fix, add to your [tmc5160 extruder] section:
+    driver_SGT: 13
+```
 
-A tested reference for **TMC5160 + Sherpa Mini**: `driver_SGT: 15` gives SG ≈ 540 at low flow, ≈ 90 near slip.
-A tested reference for **TMC2240 + Sherpa Mini**: `driver_SGT: 5` gives a similar useful range.
+To skip Auto-SGT entirely (use your config value as-is), pass `AUTO_SGT=0`.
+
+> **Why probe at the start flow?** SGT effects on the SG-vs-load curve are flow-dependent. Calibrating at the exact load where the test begins gives the most representative baseline. Probing at a lower flow can leave the test starting with too little dynamic range.
 
 ---
 
@@ -90,8 +97,8 @@ sense_resistor: 0.075            # ADAPT
 interpolate: false
 # DO NOT add stealthchop_threshold — see "Chopper mode" notes below
 coolstep_threshold: 0.5          # required for StallGuard reads (NOT for CoolStep)
-driver_SGT: 15                   # SG2 sensitivity, signed -64..63 (higher = less sensitive)
-driver_SFILT: 1                  # SG2 filter (recommended for extruders)
+driver_SGT: 15                   # SG2 sensitivity, signed -64..63 (Auto-SGT will tune this)
+driver_SFILT: 1                  # SG2 filter — REQUIRED for clean signal
 ```
 
 #### TMC2240
@@ -108,8 +115,8 @@ hold_current: 0.6                # ADAPT
 interpolate: false
 # DO NOT add stealthchop_threshold — SG2 needs SpreadCycle
 coolstep_threshold: 0.5          # required for StallGuard reads (NOT for CoolStep)
-driver_SGT: 5                    # SG2 sensitivity, signed -64..63 (higher = less sensitive)
-driver_SFILT: 1                  # SG2 filter (recommended for extruders)
+driver_SGT: 15                   # SG2 sensitivity (Auto-SGT will tune this)
+driver_SFILT: 1                  # SG2 filter — REQUIRED for clean signal
 ```
 
 > **Switching from SG4 to SG2 on TMC2240?** If you previously ran the TMC2240 with `stealthchop_threshold: 999999` and a `SET_TMC_FIELD ... sg4_thrs ...` macro for sensorless homing, you'll need to disable that for the test. The plugin will detect StealthChop in `TMC_FLOW_STATUS` and tell you what to remove.
@@ -128,6 +135,8 @@ coolstep_threshold: 0.5          # required for StallGuard reads
 driver_SGTHRS: 100               # SG4 sensitivity (0-255, higher = more sensitive)
 ```
 
+> **Note**: Auto-SGT is currently only supported for SG2 drivers (TMC5160, TMC2130, TMC2240). On TMC2209 the plugin uses your configured `driver_SGTHRS` value directly.
+
 ### Plugin section
 
 ```ini
@@ -140,6 +149,12 @@ melt_zone_length: 42             # ADAPT: hotend melt-zone length (Sherpa Mini ~
 #min_hotend_temp: 180            # safety floor, default 180
 #output_dir: ~/printer_data/config/Flowtest
 ```
+
+### SFILT — keep it on
+
+`driver_SFILT: 1` enables the StallGuard hardware filter (averages SG over 4 cycles). The plugin's slip detection thresholds are **calibrated against filtered SG signal** — running with `driver_SFILT: 0` produces noisy per-sample variance that triggers false positives in the coarse phase.
+
+If you've previously run the test with `SFILT=0` and got early triggers (e.g. at flow=50), set `driver_SFILT: 1`, FIRMWARE_RESTART, and re-test.
 
 ### CoolStep — what about it?
 
@@ -171,20 +186,32 @@ If you're not sure what mode you're in, run `TMC_FLOW_STATUS` — the plugin che
 
 ## How it works
 
-The plugin samples StallGuard at 20 Hz during each measurement step (5 repeats by default) and tracks median, IQR (P25–P75), and run-to-run CV per step. Slip detection uses **multiple independent triggers** that look for different signatures:
+The plugin samples StallGuard at 20 Hz during each measurement step (5 repeats × 5 s by default) and tracks median, IQR (P25–P75), and run-to-run CV per step. Slip detection uses **multiple independent triggers** that look for different signatures:
 
-- **SG signal patterns** — snap-back, over-jump, plateau
+- **SG signal patterns** — snap-back, over-jump, plateau (with saturation-skip and median-baseline)
 - **Run-to-run variance** — CV spike, CV jump, rising trend, vs coarse-baseline
 - **Sample distribution** — IQR widening, IQR vs coarse-baseline, IQR absolute
-- **Per-run analysis** — single-run outlier detection, SG max spike for decoupling
+- **Per-run analysis** — single-run outlier detection (warmup-aware), SG max spike for decoupling
 
 Each trigger fires under tighter conditions in **bisection / verify** than in coarse, so the coarse phase stays noise-resistant while the final result is accurate to ±1 mm³/s.
 
 The HTML report's **decision-trail panel** lists every trigger event with the metrics that caused it, so you can see exactly why the plugin chose the value it did.
 
+### Warmup-skip
+
+The first repetition of every measurement step shows different behaviour than the others (motor transitions from cold-stop, filament path settles). The plugin detects this drift and excludes run 1 from the median/IQR/CV stats when it deviates significantly from the rest. The threshold is per-driver — TMC2240 needs a more aggressive 4 % cutoff (vs. 10 % for TMC5160) because of its systematic 3–6 % first-run drift.
+
 ### Per-driver tuning
 
-Each driver family has its own `TriggerProfile` in the source code with all detection thresholds. The TMC5160 profile is the validated production baseline. TMC2240 (SG2 path) inherits the same values since the hardware path is identical. TMC2209 has its own profile for the SG4 path. To tune sensitivity for one driver without affecting the others, edit only its profile class.
+Each driver family has its own `TriggerProfile` in the source code with all detection thresholds:
+
+- **TMC5160Profile** — validated production baseline (SGT=15, SFILT=1)
+- **TMC2240Profile** — inherits TMC5160 base, with TMC2240-specific overrides:
+  - `WARMUP_DRIFT_THRESHOLD = 0.04` — catches the systematic first-run drift
+  - `PLATEAU_RATIO = 0.2` — the SG2 saturation curve is steeper on TMC2240
+- **TMC2209Profile** — for the SG4 path
+
+To tune sensitivity for one driver without affecting the others, edit only its profile class.
 
 ---
 
@@ -192,7 +219,7 @@ Each driver family has its own `TriggerProfile` in the source code with all dete
 
 ### `TMC_FLOW_FIND_MAX`
 
-Run the StallGuard-based flow test (Coarse → Bisection → Verification).
+Run the StallGuard-based flow test (Auto-SGT → Coarse → Bisection → Verification).
 
 | Parameter | Default | Description |
 |---|---|---|
@@ -206,6 +233,8 @@ Run the StallGuard-based flow test (Coarse → Bisection → Verification).
 | `COOLDOWN` | 15 | Pause between phases (seconds) |
 | `PURGE` | 0 | Purge length (mm) before test |
 | `MAX_BISECT_STEPS` | 6 | Max bisection iterations |
+| `AUTO_SGT` | 1 | `1` = run Auto-SGT calibration before test (SG2 drivers only). `0` = skip |
+| `KEEP_SGT` | 0 | `1` = leave the tuned SGT active until next FIRMWARE_RESTART. `0` = restore original after test |
 | `NO_HTML` | 0 | Set 1 to skip HTML report |
 | `SKIP_TMC_CHECK` | 0 | Set 1 to bypass config validation |
 
@@ -222,8 +251,14 @@ Diagnostic check: reads current SG value, verifies driver, chopper mode, and Sta
 ## Examples
 
 ```
-# Standard test, fast extruders
-TMC_FLOW_FIND_MAX MAX=150 START=20
+# Standard test (Auto-SGT on by default)
+TMC_FLOW_FIND_MAX MAX=150 START=10
+
+# Same test, but keep the tuned SGT after test ends
+TMC_FLOW_FIND_MAX MAX=150 START=10 KEEP_SGT=1
+
+# Skip Auto-SGT and use your configured SGT directly
+TMC_FLOW_FIND_MAX MAX=150 START=10 AUTO_SGT=0
 
 # Quicker, less accurate
 TMC_FLOW_FIND_MAX REPEAT=3 VERIFY_REPEATS=3 COOLDOWN=10
@@ -267,17 +302,17 @@ Add `stealthchop_threshold: 999999` to your `[tmc2209 extruder]` section, `FIRMW
 **`TMC_FLOW_STATUS` reports "SGTHRS is 0"** *(TMC2209 only)* —
 Add `driver_SGTHRS: 100` to your `[tmc2209 extruder]` section.
 
-**SG values too low / saturate at 0** —
-Sensitivity is too high. Raise `driver_SGT` (SG2 drivers) or lower `driver_SGTHRS` (TMC2209).
+**Auto-SGT can't reach target range** —
+Console says "could not reach target range" after 5 iterations. Usually means your SGT is at an extreme (e.g. -64 or +63) and still doesn't produce useful SG values. Check your `run_current` — if it's very low, even max-sensitive SGT may not see enough load. Try increasing `run_current` slightly or running with `AUTO_SGT=0` and a manually-chosen SGT.
 
-**SG values too high / saturate at 1023** —
-Sensitivity is too low. Lower `driver_SGT` (SG2 drivers) or raise `driver_SGTHRS` (TMC2209).
+**Trigger fires very early in coarse phase (e.g. at flow=50)** —
+Most common causes:
+1. **SFILT is off** — check that `driver_SFILT: 1` is in your TMC section. SG noise without filter triggers false plateau detection.
+2. **SGT was set too high** before Auto-SGT ran (or Auto-SGT is disabled). Re-run with default `AUTO_SGT=1`, or check the `Auto-SGT: tuned to SGT=N` line in the console output.
+3. **CoolStep is masking signal** — try setting `driver_SEMIN: 0` for the most conservative result.
 
 **Test reaches MAX without trigger** —
-Either your hotend really can flow that fast (raise MAX), or SG sensitivity is too low (see "SG too high" above).
-
-**Trigger fires immediately at START** —
-SG sensitivity is too high (see "SG too low"), or your hotend isn't fully heated.
+Either your hotend really can flow that fast (raise MAX), or SG sensitivity is still too low. Check the Auto-SGT output — if it tuned to a very high SGT (e.g. > 30), your motor torque headroom is bigger than the test's MAX value.
 
 **TMC2240 results much lower than expected (<70 mm³/s on a fast extruder)** —
 Check that you're running in **SpreadCycle/SG2** mode, not StealthChop/SG4. The SG4 path of the TMC2240 reduces peak torque by ~50 %. `TMC_FLOW_STATUS` will tell you which mode is active. Remove `stealthchop_threshold` from your `[tmc2240]` section if present.
@@ -287,6 +322,9 @@ Check filament consistency, hotend temperature stability, possible filament path
 
 **"CoolStep is active" notice** —
 The plugin works fine with CoolStep on, but for the most conservative result set `driver_SEMIN: 0` to disable CoolStep during testing. CoolStep can dampen StallGuard signal during high-load steps.
+
+**Auto-SGT keeps tuning to the same value as my config** —
+That's fine — it confirms your SGT is already optimal. The console will say "current SGT=N already optimal — no change needed".
 
 ---
 
