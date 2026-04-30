@@ -90,7 +90,7 @@ interpolate: false
 # DO NOT add stealthchop_threshold — see "Chopper mode" notes below
 coolstep_threshold: 0.5
 driver_SGT: 15                   # SG2 sensitivity, signed -64..63 (higher = less sensitive)
-driver_SFILT: True               # SG2 filter (recommended for extruders)
+driver_SFILT: 1              # SG2 filter (recommended for extruders)
 driver_SEMIN: 2                  # CoolStep — set to 0 to disable
 driver_SEMAX: 4
 driver_SEUP: 3
@@ -110,8 +110,8 @@ hold_current: 0.6                # ADAPT
 interpolate: false
 stealthchop_threshold: 999999    # required if using SG4 path
 coolstep_threshold: 0.5
-driver_sg4_thrs: 80              # SG4 sensitivity (0-255, higher = more sensitive)
-driver_sg4_filt_en: True
+driver_SG4_THRS: 80              # SG4 sensitivity (0-255, higher = more sensitive)
+driver_SG4_SFILT: 1
 driver_SEMIN: 5                  # CoolStep — set to 0 to disable
 driver_SEMAX: 2
 driver_SEUP: 2
@@ -281,20 +281,6 @@ SG sensitivity is too high (see "SG too low"), or your hotend isn't fully heated
 
 **Result varies between runs by more than 5 mm³/s** —
 Check filament consistency, hotend temperature stability, possible filament path obstructions. Increase `COOLDOWN` between phases (e.g. 30 s).
-
----
-
-## How is this different from a flow tower print?
-
-| Flow tower print | TMC Flow Test |
-|---|---|
-| Visually inspect for under-extrusion | Reads motor's actual load signal |
-| Subjective threshold | Objective StallGuard data |
-| Wastes filament + ~1 hour | No filament wasted, ~10 minutes |
-| One value per test | Full statistical profile + decision trail |
-| Tells you when extrusion *looks* bad | Tells you when the *motor is starting to slip* |
-
-Both methods measure different things — the motor can slip before extrusion looks bad (under-extrusion), or extrusion can look bad before the motor slips (cooling / pressure issues). For maximum-flow tuning where torque is the limit, this plugin is the more direct measurement.
 
 ---
 
