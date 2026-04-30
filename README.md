@@ -96,9 +96,9 @@ See [StallGuard tuning](#2-stallguard-tuning) below for the complete tuning work
 
 | Driver  | StallGuard | Required chopper mode for the test       | Tested |
 | ------- | ---------- | ---------------------------------------- | ------ |
-| TMC2240 | SG4 / SG2  | StealthChop (SG4) **or** SpreadCycle (SG2) | ✅ SG4 path tested (Sherpa Mini, ~57 mm³/s) |
-| TMC2209 | SG4        | StealthChop only                         | ✅ tested  |
-| TMC5160 | SG2        | SpreadCycle (only mode SG2 works in)     | ✅ tested (Sherpa Mini, ~117 mm³/s) |
+| TMC2240 | SG4 / SG2  | StealthChop (SG4) **or** SpreadCycle (SG2) | ✅ tested (previous version) |
+| TMC2209 | SG4        | StealthChop only                         | ✅ tested (previous version) |
+| TMC5160 | SG2        | SpreadCycle (only mode SG2 works in)     | ✅ tested (actual version) |
 | TMC2130 | SG2        | SpreadCycle                              | code path present, untested |
 | TMC2660 | SG2        | SpreadCycle                              | code path present, untested |
 | TMC2208 / TMC2226 | — | (no StallGuard; not supported)         | not supported |
