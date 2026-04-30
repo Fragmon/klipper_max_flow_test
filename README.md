@@ -25,12 +25,15 @@ The plugin reads the TMC driver's **StallGuard** load signal during extrusion to
 
 Output: a CSV with raw data and an interactive HTML report with a **decision trail** (every trigger that fired, why, and which value defined the result).
 
-Real-world results on a Sherpa Mini extruder:
+Real-world results on a Sherpa Mini extruder (run_current 0.85 A):
 
 | Driver | Mode | Max safe flow |
 |---|---|---|
-| TMC2240 | StealthChop, 0.85 A | **57 mm³/s** |
-| TMC5160 | SpreadCycle, 0.85 A | **116 mm³/s** |
+| TMC5160 | SpreadCycle / SG2 | **~110 mm³/s** |
+| TMC2240 | SpreadCycle / SG2 | **~110 mm³/s** |
+| TMC2240 | StealthChop / SG4 | ~60 mm³/s *(not recommended)* |
+
+> **Important for TMC2240 users**: The plugin runs the TMC2240 in the **SG2/SpreadCycle path** (same as TMC5160). The TMC2240's SG4/StealthChop path delivers ~50 % less peak torque — it's intended for sensorless homing, not high-flow extrusion. See [TMC2240 config](#tmc2240) below.
 
 ---
 
@@ -55,25 +58,23 @@ Test takes ~10 minutes (+30–60 s if borderline measurements need re-testing). 
 
 ## Before you run: SG range check
 
-The plugin only works well when StallGuard produces a **usable signal range**. Run the test once and watch the SG values printed in the Klipper console.
+The plugin only works well when StallGuard produces a **usable signal range**. Run `TMC_FLOW_STATUS` first to see the current SG value, then run a short test and watch the SG values printed in the Klipper console.
 
 | Driver | Sensitivity field | Healthy SG range across the sweep |
 |---|---|---|
-| TMC2240 (SG4) | `sg4_thrs` (via `SET_TMC_FIELD`) | low load: ~300–500, near slip: ~50–150 |
-| TMC2209 (SG4) | `driver_SGTHRS` | similar to TMC2240 |
-| TMC5160 / 2130 (SG2) | `driver_SGT` | low load: ~400–600, near slip: ~50–150 |
+| TMC5160 / TMC2240 / TMC2130 (SG2) | `driver_SGT` | low load: ~400–600, near slip: ~50–150 |
+| TMC2209 (SG4) | `driver_SGTHRS` | low load: ~300–500, near slip: ~50–150 |
 
 You want **at least 200 raw SG units** of dynamic range between low-load and high-load, with neither end saturated (0 or 1023).
 
 **SG too low** (median <50, often saturating at 0):
-- TMC5160: raise `driver_SGT` (e.g. +5 to +10)
-- TMC2240: lower `sg4_thrs` via `SET_TMC_FIELD` (e.g. by 20)
+- SG2 drivers (TMC5160 / TMC2240 / TMC2130): raise `driver_SGT` (e.g. +5 to +10)
 - TMC2209: lower `driver_SGTHRS` (e.g. by 20)
 
-**SG too high** (often saturating at 1023):
-- Opposite of above.
+**SG too high** (often saturating at 1023): opposite of above.
 
 A tested reference for **TMC5160 + Sherpa Mini**: `driver_SGT: 15` gives SG ≈ 540 at low flow, ≈ 90 near slip.
+A tested reference for **TMC2240 + Sherpa Mini**: `driver_SGT: 5` gives a similar useful range.
 
 ---
 
@@ -96,46 +97,30 @@ hold_current: 0.6                # ADAPT
 sense_resistor: 0.075            # ADAPT
 interpolate: false
 # DO NOT add stealthchop_threshold — see "Chopper mode" notes below
-coolstep_threshold: 0.5
+coolstep_threshold: 0.5          # required for StallGuard reads (NOT for CoolStep)
 driver_SGT: 15                   # SG2 sensitivity, signed -64..63 (higher = less sensitive)
-driver_SFILT: 1                  # SG2 filter (recommended for extruders, default 0)
-driver_SEMIN: 2                  # CoolStep lower threshold — set to 0 to disable CoolStep
-driver_SEMAX: 4                  # CoolStep upper threshold (hysteresis)
-driver_SEUP: 3                   # Current step-up speed (0-3, higher = faster)
-driver_SEDN: 2                   # Current step-down speed (0-3, higher = faster)
-driver_SEIMIN: 1                 # Min current: 0 = 50 %, 1 = 25 % of run_current
+driver_SFILT: 1                  # SG2 filter (recommended for extruders)
 ```
 
 #### TMC2240
+
+The plugin runs TMC2240 in **SG2/SpreadCycle mode** — same path as TMC5160. This gives ~50 % more peak torque than the SG4/StealthChop path.
 
 ```ini
 [tmc2240 extruder]
 cs_pin: PA15                     # ADAPT
 spi_bus: spi4                    # ADAPT
-rref: 12300                      # ADAPT
+rref: 12300                      # ADAPT (12000-60000 depending on hardware)
 run_current: 0.85                # ADAPT
 hold_current: 0.6                # ADAPT
 interpolate: false
-stealthchop_threshold: 999999    # required if using SG4 path
-coolstep_threshold: 0.5
-driver_SEMIN: 2                  # CoolStep lower threshold — set to 0 to disable
-driver_SEMAX: 4                  # CoolStep upper threshold (hysteresis)
-driver_SEUP: 3                   # Current step-up speed (0-3, higher = faster)
-driver_SEDN: 2                   # Current step-down speed (0-3, higher = faster)
-driver_SEIMIN: 1                 # Min current: 0 = 50 %, 1 = 25 % of run_current
+# DO NOT add stealthchop_threshold — SG2 needs SpreadCycle
+coolstep_threshold: 0.5          # required for StallGuard reads (NOT for CoolStep)
+driver_SGT: 5                    # SG2 sensitivity, signed -64..63 (higher = less sensitive)
+driver_SFILT: 1                  # SG2 filter (recommended for extruders)
 ```
 
-> **TMC2240 SG4 sensitivity & filter**: Klipper (Kalico) does NOT expose `SG4_THRS` or `sg4_filt_en` as config-line options for TMC2240 — they have to be set at runtime. Add this block *outside* the `[tmc2240]` section:
->
-> ```ini
-> [delayed_gcode setup_extruder_sg4]
-> initial_duration: 2.0
-> gcode:
->   SET_TMC_FIELD STEPPER=extruder FIELD=sg4_thrs VALUE=80
->   SET_TMC_FIELD STEPPER=extruder FIELD=sg4_filt_en VALUE=1
-> ```
->
-> Adjust the `sg4_thrs` value (0-255, higher = more sensitive) for your hardware — see the SG-range table above.
+> **Switching from SG4 to SG2 on TMC2240?** If you previously ran the TMC2240 with `stealthchop_threshold: 999999` and a `SET_TMC_FIELD ... sg4_thrs ...` macro for sensorless homing, you'll need to disable that for the test. The plugin will detect StealthChop in `TMC_FLOW_STATUS` and tell you what to remove.
 
 #### TMC2209
 
@@ -146,14 +131,9 @@ run_current: 0.85                # ADAPT
 hold_current: 0.6                # ADAPT
 sense_resistor: 0.110            # ADAPT
 interpolate: false
-stealthchop_threshold: 999999
-coolstep_threshold: 0.5
+stealthchop_threshold: 999999    # SG4 requires StealthChop
+coolstep_threshold: 0.5          # required for StallGuard reads
 driver_SGTHRS: 100               # SG4 sensitivity (0-255, higher = more sensitive)
-driver_SEMIN: 2                  # CoolStep lower threshold — set to 0 to disable
-driver_SEMAX: 4                  # CoolStep upper threshold (hysteresis)
-driver_SEUP: 3                   # Current step-up speed (0-3, higher = faster)
-driver_SEDN: 2                   # Current step-down speed (0-3, higher = faster)
-driver_SEIMIN: 1                 # Min current: 0 = 50 %, 1 = 25 % of run_current
 ```
 
 ### Plugin section
@@ -169,17 +149,27 @@ melt_zone_length: 42             # ADAPT: hotend melt-zone length (Sherpa Mini ~
 #output_dir: ~/printer_data/config/Flowtest
 ```
 
+### CoolStep — what about it?
+
+CoolStep is the TMC feature that dynamically reduces motor current under low load. **The plugin does not require CoolStep to be on or off** — slip detection uses StallGuard signal directly.
+
+You can keep your existing CoolStep configuration in the `[tmc<NNNN>]` section. The plugin prints a notice at test start indicating whether CoolStep is active.
+
+For the **most conservative max-flow result**, set `driver_SEMIN: 0` (CoolStep off). With CoolStep off, the motor runs at constant `run_current` — the test then reflects what the motor can sustain at that exact current, which matches what happens during high-load printing.
+
+If you leave CoolStep on, the test still works, but CS-driven current changes during the sweep can dampen the StallGuard signal slightly and produce a marginally higher (less conservative) result.
+
 ---
 
-## Chopper mode (important for SG4 drivers)
+## Chopper mode (important)
 
 Each TMC chip family supports StallGuard only in one specific chopper mode:
 
 | Driver | StallGuard variant | Required mode |
 |---|---|---|
+| TMC5160 / TMC2130 / TMC2660 | SG2 | **SpreadCycle** (Klipper default — **don't add `stealthchop_threshold`**) |
+| TMC2240 | SG2 *(used by this plugin)* | **SpreadCycle** (don't add `stealthchop_threshold`) |
 | TMC2209 | SG4 | StealthChop (`stealthchop_threshold: 999999`) |
-| TMC2240 | SG4 *(default)* or SG2 | StealthChop for SG4, SpreadCycle (`sg4_thrs: 0`) for SG2 |
-| TMC5160 / 2130 / 2660 | SG2 | SpreadCycle (Klipper default — **don't add `stealthchop_threshold`**) |
 
 > **`stealthchop_threshold: 0` is NOT the same as "no line".** It enables StealthChop with threshold 0, which breaks SG2. For SG2 drivers, **remove the line entirely**.
 
@@ -189,17 +179,20 @@ If you're not sure what mode you're in, run `TMC_FLOW_STATUS` — the plugin che
 
 ## How it works
 
-The plugin samples StallGuard at 20 Hz during each measurement step (5 repeats by default) and tracks median, IQR (P25-P75), and run-to-run CV per step. Slip detection uses **14 independent triggers** that look for different signatures:
+The plugin samples StallGuard at 20 Hz during each measurement step (5 repeats by default) and tracks median, IQR (P25–P75), and run-to-run CV per step. Slip detection uses **multiple independent triggers** that look for different signatures:
 
 - **SG signal patterns** — snap-back, over-jump, plateau
 - **Run-to-run variance** — CV spike, CV jump, rising trend, vs coarse-baseline
 - **Sample distribution** — IQR widening, IQR vs coarse-baseline, IQR absolute
-- **CoolStep-specific** — CS pegged + SG drop, CS pegged + CV spike, CS hard drop
 - **Per-run analysis** — single-run outlier detection, SG max spike for decoupling
 
 Each trigger fires under tighter conditions in **bisection / verify** than in coarse, so the coarse phase stays noise-resistant while the final result is accurate to ±1 mm³/s.
 
 The HTML report's **decision-trail panel** lists every trigger event with the metrics that caused it, so you can see exactly why the plugin chose the value it did.
+
+### Per-driver tuning
+
+Each driver family has its own `TriggerProfile` in the source code with all detection thresholds. The TMC5160 profile is the validated production baseline. TMC2240 (SG2 path) inherits the same values since the hardware path is identical. TMC2209 has its own profile for the SG4 path. To tune sensitivity for one driver without affecting the others, edit only its profile class.
 
 ---
 
@@ -207,29 +200,30 @@ The HTML report's **decision-trail panel** lists every trigger event with the me
 
 ### `TMC_FLOW_FIND_MAX`
 
-Auto-detect mode (SG-only or CoolStep) from `driver_SEMIN` and run the full three-phase test.
+Run the StallGuard-based flow test (Coarse → Bisection → Verification).
 
 | Parameter | Default | Description |
 |---|---|---|
 | `START` | 10 | Starting flow (mm³/s) |
 | `MAX` | 80 | Upper search bound |
-| `STEP` | 10 | Coarse sweep step size |
+| `COARSE_STEP` | 10 | Coarse sweep step size |
 | `MIN_STEP` | 1 | Bisection precision |
 | `DURATION` | 5 | Seconds per measurement |
 | `REPEAT` | 5 | Repetitions per measurement |
 | `VERIFY_REPEATS` | 5 | Repetitions in the verify phase |
 | `COOLDOWN` | 15 | Pause between phases (seconds) |
-| `TEMP` | hotend target | Override temperature |
-| `MODE` | auto | `auto`, `sg`, or `cs` |
+| `PURGE` | 0 | Purge length (mm) before test |
+| `MAX_BISECT_STEPS` | 6 | Max bisection iterations |
 | `NO_HTML` | 0 | Set 1 to skip HTML report |
+| `SKIP_TMC_CHECK` | 0 | Set 1 to bypass config validation |
 
 ### `TMC_FLOW_STATUS`
 
-Diagnostic check: verifies driver, chopper mode, StallGuard threshold, CoolStep config. **Run this before the first test.**
+Diagnostic check: reads current SG value, verifies driver, chopper mode, and StallGuard threshold. **Run this before the first test.**
 
-### Convenience aliases
-
-`TMC_FLOW_FIND_MAX_SG` and `TMC_FLOW_FIND_MAX_CS` force the respective mode.
+| Parameter | Default | Description |
+|---|---|---|
+| `ACTIVATE` | 1 | Briefly run motor (1 mm extrusion) so SG can be read |
 
 ---
 
@@ -256,15 +250,14 @@ TMC_FLOW_STATUS
 Files saved to `~/printer_data/config/Flowtest/`:
 
 ```
-tmc_flow_<mode>_YYYY-MM-DD_HH-MM-SS.csv     ← raw data
-tmc_flow_<mode>_YYYY-MM-DD_HH-MM-SS.html    ← interactive report
+tmc_flow_YYYY-MM-DD_HH-MM-SS.csv     ← raw data
+tmc_flow_YYYY-MM-DD_HH-MM-SS.html    ← interactive report
 ```
 
 The HTML report includes:
 - **Result panel** — max safe flow, slicer recommendations (80 % / 90 %)
 - **Decision trail** — every trigger event with the "healthy ranges" that defined what was considered normal
 - **SG vs flow chart** with median + IQR, phase markers, and trigger annotations marking exactly where slip was detected
-- **CS_ACTUAL chart** (CoolStep mode)
 - **TMC settings snapshot** at test start (collapsible) for reproducible documentation
 
 The CSV header includes the same TMC settings block for paper-trail purposes.
@@ -273,23 +266,20 @@ The CSV header includes the same TMC settings block for paper-trail purposes.
 
 ## Troubleshooting
 
-**`TMC_FLOW_STATUS` reports "StealthChop not active"** *(SG4 drivers only)* —
-Add `stealthchop_threshold: 999999` to your TMC section, `FIRMWARE_RESTART`.
+**`TMC_FLOW_STATUS` reports "StallGuard2 needs SpreadCycle"** *(SG2 drivers — TMC5160, TMC2130, TMC2240)* —
+Remove the `stealthchop_threshold:` line entirely from your TMC section, `FIRMWARE_RESTART`. For TMC2240: also remove any `[delayed_gcode]` block that sets `sg4_thrs` or `sg4_filt_en` — they're not needed in SG2 mode.
 
-**`TMC_FLOW_STATUS` reports "StallGuard2 needs SpreadCycle"** *(SG2 drivers only)* —
-Remove the `stealthchop_threshold:` line entirely from your TMC section, `FIRMWARE_RESTART`.
+**`TMC_FLOW_STATUS` reports "StealthChop not active"** *(TMC2209 only)* —
+Add `stealthchop_threshold: 999999` to your `[tmc2209 extruder]` section, `FIRMWARE_RESTART`.
 
-**`TMC_FLOW_STATUS` reports "sg4_thrs is 0" / "SGTHRS is 0"** —
-For TMC2240: `sg4_thrs` is not a config-line option — set it via the `delayed_gcode` block shown in the [TMC2240 config section](#tmc2240). For TMC2209: add `driver_SGTHRS: 100` to your `[tmc2209 extruder]` section.
+**`TMC_FLOW_STATUS` reports "SGTHRS is 0"** *(TMC2209 only)* —
+Add `driver_SGTHRS: 100` to your `[tmc2209 extruder]` section.
 
 **SG values too low / saturate at 0** —
-Sensitivity is too high. Raise `driver_SGT` (TMC5160) or lower `sg4_thrs` (TMC2240, via `SET_TMC_FIELD`) / `driver_SGTHRS` (TMC2209).
+Sensitivity is too high. Raise `driver_SGT` (SG2 drivers) or lower `driver_SGTHRS` (TMC2209).
 
 **SG values too high / saturate at 1023** —
-Sensitivity is too low. Opposite of above (lower `driver_SGT`, raise `sg4_thrs`/`driver_SGTHRS`).
-
-**`CS_ACTUAL` stays pinned at 31** *(CS mode only)* —
-SEMIN is too high for your motor's SG range. Common on TMC5160 with `SEMIN: 5` copied from XY-stepper templates. The plugin handles this automatically (falls back to SG triggers and prints a recommended SEMIN at the end). Per Trinamic AN-002, `SEMIN ≈ SG_MAX/4..SG_MAX/8` — for typical extruder SG_MAX of 60–80, try `driver_SEMIN: 2`.
+Sensitivity is too low. Lower `driver_SGT` (SG2 drivers) or raise `driver_SGTHRS` (TMC2209).
 
 **Test reaches MAX without trigger** —
 Either your hotend really can flow that fast (raise MAX), or SG sensitivity is too low (see "SG too high" above).
@@ -297,8 +287,14 @@ Either your hotend really can flow that fast (raise MAX), or SG sensitivity is t
 **Trigger fires immediately at START** —
 SG sensitivity is too high (see "SG too low"), or your hotend isn't fully heated.
 
+**TMC2240 results much lower than expected (<70 mm³/s on a fast extruder)** —
+Check that you're running in **SpreadCycle/SG2** mode, not StealthChop/SG4. The SG4 path of the TMC2240 reduces peak torque by ~50 %. `TMC_FLOW_STATUS` will tell you which mode is active. Remove `stealthchop_threshold` from your `[tmc2240]` section if present.
+
 **Result varies between runs by more than 5 mm³/s** —
 Check filament consistency, hotend temperature stability, possible filament path obstructions. Increase `COOLDOWN` between phases (e.g. 30 s).
+
+**"CoolStep is active" notice** —
+The plugin works fine with CoolStep on, but for the most conservative result set `driver_SEMIN: 0` to disable CoolStep during testing. CoolStep can dampen StallGuard signal during high-load steps.
 
 ---
 
@@ -308,7 +304,7 @@ Check filament consistency, hotend temperature stability, possible filament path
 |---|---|
 | Visually inspect for under-extrusion | Reads motor's actual load signal |
 | Subjective threshold | Objective StallGuard data |
-| Wastes filament + ~1 hour | No filament wasted, ~10 minutes |
+| Wastes filament + ~1 hour | Minimal filament, ~10 minutes |
 | One value per test | Full statistical profile + decision trail |
 | Tells you when extrusion *looks* bad | Tells you when the *motor is starting to slip* |
 
