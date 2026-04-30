@@ -53,6 +53,40 @@ Slicer recommendation:
 ==================================
 ```
 
+### What to check before running the test
+
+The plugin only works well when StallGuard produces a **usable signal range** for your hardware. If the `SG_RESULT` values printed during the test sit in the wrong window, the triggers can't distinguish slip from noise. **Run the test once and look at the SG values printed live for each step.**
+
+#### Target SG range
+
+| Driver | Field that shifts the range | Healthy SG range across your test flows | Why |
+|---|---|---|---|
+| TMC2240 (SG4) | `driver_sg4_thrs` | low load: ~300–500, near slip: ~50–150 | SG4 falls as load rises; needs headroom at low loads so slip is visible |
+| TMC2209 (SG4) | `driver_SGTHRS` | similar to TMC2240 | same engine, same direction |
+| TMC5160 / 2130 (SG2) | `driver_SGT` | low load: ~400–600, near slip: ~50–150 | SG2 also falls with load but on a 0–1023 scale; SGT shifts the whole curve up/down |
+
+The exact numbers don't have to match — what matters is that you have **at least 200 raw SG units of dynamic range** between low-load and near-slip readings, and that **neither end is saturated** (SG = 0 at high load, or SG = 1023 at low load).
+
+#### What to do if your SG range is off
+
+**SG values too low** (median below ~50 across the whole sweep, or sitting at 0 most of the time):
+- TMC5160 / 2130: **raise** `driver_SGT` (it's signed, higher = less sensitive = higher SG_RESULT). Try +5 or +10 increments.
+- TMC2240 / 2209: **lower** `driver_sg4_thrs` / `driver_SGTHRS`. Try in 20-unit steps.
+- Symptom: false-positive triggers in coarse phase, test stops at very low flow without real slip.
+
+**SG values too high** (median sitting near 1023, or above 800 even at high flows):
+- TMC5160 / 2130: **lower** `driver_SGT`.
+- TMC2240 / 2209: **raise** `driver_sg4_thrs` / `driver_SGTHRS`.
+- Symptom: test reaches `MAX` without triggering, even though the motor obviously struggles.
+
+**SG range looks fine but test still triggers too early:**
+- Increase `coolstep_threshold` slightly (e.g. from `0.5` to `1.0`) — gates StallGuard above a minimum velocity, suppresses noise during ramps.
+- Enable the SG filter: `driver_SFILT: True` (TMC5160) or `driver_sg4_filt_en: True` (TMC2240). Smooths over 4 full-steps.
+
+**A tested reference for TMC5160** (Sherpa Mini, 0.85 A, PLA at 230 °C): `driver_SGT: 15` produces SG ≈ 540 at 20 mm³/s and SG ≈ 90 at 110 mm³/s. Use this as a starting point.
+
+See [StallGuard tuning](#2-stallguard-tuning) below for the complete tuning workflow.
+
 ---
 
 ## Requirements
@@ -107,23 +141,42 @@ Test takes ~10 minutes by default. CSV and HTML report are saved to `~/printer_d
 
 ## How it works
 
-The plugin reads StallGuard (`SG_RESULT` / `SG4_RESULT`) and CoolStep current scale (`CS_ACTUAL`) at 20 Hz during extrusion. Slip detection uses three independent triggers — any one fires:
+The plugin reads StallGuard (`SG_RESULT` / `SG4_RESULT`) and CoolStep current scale (`CS_ACTUAL`) at 20 Hz during extrusion. Each measurement step runs N repetitions (5 by default), and the plugin tracks median, IQR (P25–P75) and run-to-run variance (CV%) per step.
 
-**1. Reload jump (snap-back).** During normal extrusion the SG signal trends in one direction with rising flow. When the motor decouples (slip), SG snaps sharply back toward its no-load value. The plugin learns the trend direction from the recent steps so this works for both SG2 (SG falls with load) and SG4 (SG often rises with load on extruders).
+Slip detection layers several independent triggers — any one fires:
 
-**2. Abnormal jump.** SG moves in the trend direction, but much faster than the typical step (>2× expected, with a minimum jump size). Indicates a sudden over-acceleration of the load signal — typical SG4 slip pattern.
+### Always-on triggers (work regardless of mode)
 
-**3. CV spike (intermittent slip).** Run-to-run variance jumps from baseline (~3 %) to ≥10 % AND ≥2× the recent average. This catches the **earliest** slip onset, where individual repeats start diverging before the median itself moves. Often fires one full coarse step before the snap-back/abnormal-jump triggers do.
+**1. Snap-back.** During normal extrusion the SG signal trends in one direction with rising flow. When the motor decouples (slip), SG snaps sharply back toward its no-load value. The plugin learns the trend direction from the recent steps so this works for both SG2 (SG falls with load) and SG4 (SG often rises with load on extruders).
 
-In CoolStep mode (`driver_SEMIN > 0`), three additional CS-based triggers run alongside:
+**2. Over-jump.** SG moves in the trend direction, but much faster than the typical step (>2× expected, with a minimum jump of 5 raw units on SG2 / 15 on SG4). Sudden over-acceleration of the load signal — typical SG4 slip pattern.
 
-- CS_ACTUAL jumps up ≥+5: sudden load increase
-- CS_ACTUAL leaves regulation range: approaching slip
-- CS_ACTUAL drops sharply: motor lost load contact (hard stall)
+**3. CV spike — high variance.** Run-to-run CV jumps to ≥ 10 % AND ≥ 1.5× the recent average. Catches sudden chaotic slip.
 
-If CoolStep is configured but `CS_ACTUAL` stays pinned at 31 throughout the test (because `SEMIN` is too high for the SG range your motor produces), the plugin falls back to the SG triggers above and prints a CoolStep diagnostic with a recommended `SEMIN` value at the end.
+**4. CV jump — low baseline.** CV reaches ≥ 5 % (coarse) or ≥ 4 % (bisection) AND ≥ 2.5× (coarse) or 2.0× (bisection) the recent average. Catches the characteristic CV jump on stable SG2 setups (TMC5160) where overall variance is low but a sudden spike still indicates slip. **Often fires one full step before the snap-back/over-jump triggers do.**
 
-All triggers use median + IQR statistics over 5 repetitions per measurement (configurable) to filter single-cycle noise. The first run is excluded as warmup if it deviates more than 10 % from the rest (filament pressure buildup).
+**5. CV rising trend.** CV grows ≥ 1.3× across each of two consecutive steps AND reaches ≥ 5 % (coarse) or ≥ 4 % (bisection). Catches gradual slip onset where each individual step is borderline but the trend is unmistakable.
+
+**6. IQR/spread anomaly.** The IQR (P75 − P25) widens to ≥ 12 raw units AND ≥ 3× (coarse) or 1.7× (bisection) the recent baseline. Catches "quiet" stalls that occur briefly at the start or end of a move and are absorbed by the median over 5 repetitions, but show up as a wider sample distribution.
+
+### CoolStep-specific triggers (only when CoolStep regulates `CS_ACTUAL`)
+
+These fire only when CoolStep is genuinely adjusting current (`CS_ACTUAL` varies across steps). If `CS_ACTUAL` stays static at 31 the whole run — common on TMC5160 with low SEMIN — the plugin auto-detects that and falls back to the always-on triggers above.
+
+**7. CS pegged at max + SG drop.** `CS_ACTUAL` reaches maximum (≥ 30) while SG drops ≥ 30 % vs the previous step, and CS was actually regulating in the recent history (some prior step had CS < 25). The canonical slip signature with active CoolStep — load suddenly maxes out the current regulator.
+
+**8. CS pegged at max + CV spike.** `CS_ACTUAL` reaches maximum while CV ≥ 5 % AND a CV spike pattern fires — intermittent slip with simultaneous current saturation.
+
+**9. CS hard drop.** `CS_ACTUAL` drops by more than 8 in one step from a regulating state. Indicates the motor lost contact with the load entirely (decoupling stall — gear jumped a tooth, filament ground out, etc).
+
+### Bisection-aware sensitivity
+
+CV and IQR thresholds tighten in the bisection / verify phases — once we're already near the slip point, smaller anomalies are meaningful evidence. This keeps the coarse phase noise-resistant while making the final estimate accurate to ±1 mm³/s.
+
+### Other behaviour
+
+- **Warmup exclusion**: the first run of each measurement is excluded if it deviates more than 10 % from the rest (filament pressure buildup).
+- **First-trigger-wins**: the plugin saves a first-trigger snapshot, then continues with bisection/verify and updates the result if a tighter bound is found.
 
 ---
 
@@ -505,7 +558,7 @@ CoolStep dynamically adjusts motor current based on load. Lower current at idle/
 
 This is what `klipper_tmc_autotune` enables by default for extruders.
 
-The test detects slip via CS_ACTUAL transitions (current scale changes) when CoolStep is actively regulating, and via SG signal patterns as backup.
+The test detects slip via the [always-on triggers](#always-on-triggers-work-regardless-of-mode) (snap-back, over-jump, CV patterns, IQR spread) plus three [CoolStep-specific triggers](#coolstep-specific-triggers-only-when-coolstep-regulates-cs_actual) when CoolStep actually regulates `CS_ACTUAL`.
 
 > **Note for SG2 drivers (TMC5160, TMC2130, TMC2660):** SG_RESULT values on these drivers tend to be much lower (typically 30–100) than on SG4 drivers, so a SEMIN value copied from XY-stepper examples (often 5) leaves CoolStep permanently in "ramp current up" mode and CS stays pinned at 31. The plugin handles this correctly — it auto-detects the static CS and uses the SG-based triggers instead. Result is identical, just via a different code path. The final report includes a CoolStep diagnostic with a recommended SEMIN tuned to your hardware. See the [CS_ACTUAL stays pinned at 31 troubleshooting entry](#cs_actual-stays-pinned-at-31-throughout-the-test).
 
@@ -515,7 +568,7 @@ The motor runs at constant `IRUN` current at all times. More heat, more energy u
 
 Used by setups where motor torque reserve matters more than energy saving, or by users who prefer constant-current behaviour.
 
-The test detects slip via SG signal patterns only.
+The test detects slip via the [always-on triggers](#always-on-triggers-work-regardless-of-mode) only — the CoolStep-specific triggers are skipped because there's no CoolStep regulation to observe.
 
 ### Don't switch modes just for the test
 
