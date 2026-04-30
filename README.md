@@ -41,14 +41,19 @@ Slicer recommendation:
 - Klipper or Kalico
 - TMC stepper driver on the extruder with StallGuard support:
 
-| Driver  | StallGuard | Tested  |
-| ------- | ---------- | ------- |
-| TMC2240 | SG4        | ✅ yes  |
-| TMC2209 | SG4        | ✅ yes  |
-| TMC5160 | SG2        | fallback |
-| TMC2130 / TMC2208 / TMC2226 / TMC2660 | SG2 | fallback |
+| Driver  | StallGuard | Chopper required for SG | Tested  |
+| ------- | ---------- | ----------------------- | ------- |
+| TMC2240 | SG4        | StealthChop             | ✅ yes  |
+| TMC2209 | SG4        | StealthChop             | ✅ yes  |
+| TMC5160 | SG2        | SpreadCycle             | ✅ supported (register-direct read) |
+| TMC2130 / TMC2660 | SG2 | SpreadCycle           | register-direct read (untested) |
+| TMC2208 / TMC2226 | SG4 | StealthChop           | fallback |
 
-- **StealthChop must be the active chopper mode** for the test — see [the StealthChop section](#-important-stealthchop-required-for-stallguard) below
+- **The right chopper mode for your driver must be active** for the test:
+  - **SG4 drivers** (TMC2240, TMC2209) → **StealthChop** required
+  - **SG2 drivers** (TMC5160, TMC2130, TMC2660) → **SpreadCycle** required
+
+  See [the StealthChop section](#-important-stealthchop-required-for-stallguard) below
 - Hotend at print temperature
 
 ---
@@ -181,6 +186,45 @@ coolstep_threshold: 0.5          # required
 driver_SEMIN: 0                  # required for SG-only mode
 ```
 
+#### TMC5160, CoolStep enabled
+
+```ini
+[tmc5160 extruder]
+cs_pin: PA15                     # ADAPT: SPI chip-select pin on your board
+spi_bus: spi4                    # ADAPT: SPI bus name on your board
+spi_speed: 2000000               # ADAPT only if your board needs it
+run_current: 0.85                # ADAPT: motor RMS current
+hold_current: 0.6                # ADAPT: typically 60–70% of run_current
+sense_resistor: 0.075            # ADAPT: matches your TMC5160 module (typical 0.075 Ω)
+interpolate: false               # required for clean SG readings
+# IMPORTANT: TMC5160 uses StallGuard2, which only works in SpreadCycle.
+# Do NOT set stealthchop_threshold (or set it to 0) so the driver always
+# uses SpreadCycle.
+#stealthchop_threshold: 0
+coolstep_threshold: 0.5          # required: enables StallGuard reading above this velocity
+driver_SEMIN: 5                  # required for CoolStep mode (must be > 0)
+driver_SEMAX: 2                  # CoolStep upper threshold
+driver_SEUP: 2
+driver_SEDN: 1
+driver_SEIMIN: 1
+```
+
+#### TMC5160, CoolStep disabled
+
+```ini
+[tmc5160 extruder]
+cs_pin: PA15                     # ADAPT
+spi_bus: spi4                    # ADAPT
+spi_speed: 2000000               # ADAPT only if your board needs it
+run_current: 0.85                # ADAPT
+hold_current: 0.6                # ADAPT
+sense_resistor: 0.075            # ADAPT
+interpolate: false               # required
+#stealthchop_threshold: 0        # SpreadCycle is required for SG2
+coolstep_threshold: 0.5          # required
+driver_SEMIN: 0                  # required for SG-only mode (CoolStep disabled)
+```
+
 #### Pin reference: where to find your values
 
 If you're not sure what pins to use:
@@ -215,6 +259,24 @@ gcode:
 
 > The `VALUE=100` for `sgthrs` is a starting point. Higher = more sensitive. Range 0–255. TMC2209 has no filter field (unlike TMC2240).
 
+#### For TMC5160 (and other SG2 drivers)
+
+The plugin reads `SG_RESULT` directly from `DRV_STATUS` and uses statistical
+triggers, so a non-zero `sgt` is **not strictly required** for the test to
+work. If you also want the hardware stall stop signal, configure it like this:
+
+```ini
+[delayed_gcode setup_extruder_sg]
+initial_duration: 2.0
+gcode:
+    SET_TMC_FIELD STEPPER=extruder FIELD=sgt VALUE=4
+    SET_TMC_FIELD STEPPER=extruder FIELD=sfilt VALUE=1
+```
+
+> `sgt` is a **signed** 7-bit value (-64 to 63) on TMC5160. Higher = more
+> sensitive. Typical starting point is 2–6. `sfilt=1` enables the SG2 filter
+> for cleaner readings (recommended for extruders).
+
 ### 3. Plugin configuration
 
 ```ini
@@ -228,14 +290,16 @@ melt_zone_length: 42             # ADAPT: hotend melt-zone length in mm (Sherpa 
 #output_dir: ~/printer_data/config/Flowtest
 ```
 ---
-## ⚠️ Important: StealthChop required for StallGuard
+## ⚠️ Important: chopper mode required for StallGuard
 
-This plugin can only work when the extruder driver is in **StealthChop** mode. This is a hardware limitation of the TMC chips, not the plugin:
+This plugin needs the **right chopper mode** for your driver. This is a hardware limitation of the TMC chips, not the plugin:
 
-- **TMC2240 / TMC2209**: use **StallGuard4**, which works only in StealthChop ([source: Trinamic AN-002](https://www.analog.com/en/resources/app-notes/an-002.html))
-- **TMC5160 / TMC2130 / TMC2660**: use StallGuard2, which works only in SpreadCycle
+- **TMC2240 / TMC2209**: use **StallGuard4**, which works only in **StealthChop** ([source: Trinamic AN-002](https://www.analog.com/en/resources/app-notes/an-002.html))
+- **TMC5160 / TMC2130 / TMC2660**: use **StallGuard2**, which works only in **SpreadCycle**
 
-Klipper's default for all TMC drivers is **SpreadCycle**. Many printer profiles (Voron, RatRig, etc.) use SpreadCycle on the extruder for higher torque. **In that default state, the plugin won't work** — it will report `SG median = n/a` or fail the config check with `stealthchop_threshold` warnings.
+Klipper's default for all TMC drivers is **SpreadCycle**. That's the right default for SG2 drivers (TMC5160/2130/2660) but the **wrong** default for SG4 drivers (TMC2240/2209) — many printer profiles (Voron, RatRig, etc.) keep that default on the extruder for higher torque. **For SG4 drivers in that default state, the plugin won't work** — it will report `SG median = n/a` or fail the config check with `stealthchop_threshold` warnings.
+
+**For TMC5160:** the plugin's config check expects `stealthchop_threshold` to be unset or 0 — i.e. SpreadCycle always on. If you've added `stealthchop_threshold: 999999` to a TMC5160 section, remove it before running the test.
 
 ### How do I know which mode I'm in?
 
@@ -494,4 +558,4 @@ Inspired by Klipper's StallGuard implementation and the work of the [klipper_tmc
 
 ## Contributing
 
-Issues and pull requests welcome. If you've tested this on a driver not listed above (TMC5160, TMC2130, TMC2226, TMC2660), let me know how it went — I'd love to add confirmed-working markers for those.
+Issues and pull requests welcome. If you've tested this on a driver not listed as fully tested above (TMC2130, TMC2226, TMC2660), let me know how it went — I'd love to add confirmed-working markers for those.
