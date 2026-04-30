@@ -456,8 +456,18 @@ class TMCFlowTest:
                     % (MODULE_VERSION, mode))
             f.write("# Plugin by Steven (Fragmon) — Crydteam\n")
             f.write("# YouTube: https://www.youtube.com/@crydteamprinting\n")
+            tmc_settings = None
             for k, v in meta.items():
+                if k == 'tmc_settings':
+                    tmc_settings = v
+                    continue
                 f.write("# %s: %s\n" % (k, v))
+            # TMC settings as a separate, readable block at the end
+            # of the comment header — useful as a paper trail.
+            if tmc_settings:
+                f.write("#\n# TMC driver settings at test start:\n")
+                for label, value, raw in tmc_settings:
+                    f.write("#   %s = %s  [%s]\n" % (label, value, raw))
 
             # CSV header depends on mode
             if mode == 'cs':
@@ -600,9 +610,35 @@ new Chart(document.getElementById('csChart'), {
                 '<div class="summary"><h2>Result</h2>'
                 '<p>Test completed without trigger.</p></div>')
 
+        # Build meta info, but skip the tmc_settings list (rendered
+        # separately below as its own collapsible section).
         meta_html = ''.join(
             '<div><strong>%s:</strong> %s</div>' % (k, v)
-            for k, v in meta.items())
+            for k, v in meta.items() if k != 'tmc_settings')
+
+        # Build TMC settings block (collapsible <details> for compactness)
+        tmc_settings = meta.get('tmc_settings') or []
+        if tmc_settings:
+            tmc_rows = ''.join(
+                '<tr><td style="text-align:left">%s</td>'
+                '<td style="text-align:right;font-family:monospace">%s</td>'
+                '<td style="text-align:left;color:#888;font-family:monospace">'
+                '%s</td></tr>'
+                % (label, value, raw)
+                for label, value, raw in tmc_settings)
+            tmc_settings_html = (
+                '<details class="tmc-settings"><summary>'
+                'TMC driver settings at test start (%d fields) — '
+                'click to expand</summary>'
+                '<table class="tmc-settings-table"><thead><tr>'
+                '<th style="text-align:left">Setting</th>'
+                '<th style="text-align:right">Value</th>'
+                '<th style="text-align:left">Field</th>'
+                '</tr></thead><tbody>%s</tbody></table>'
+                '</details>'
+                % (len(tmc_settings), tmc_rows))
+        else:
+            tmc_settings_html = ''
 
         # Data table
         rows = []
@@ -702,6 +738,22 @@ h1 { color: #1565c0; }
 .chart-container { background: white; padding: 20px;
                    border-radius: 8px; margin-bottom: 20px;
                    box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+.tmc-settings { background: #fafafa; padding: 14px 18px;
+                border-radius: 8px; margin-bottom: 20px;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+                font-size: 13px; }
+.tmc-settings summary { cursor: pointer; font-weight: 600;
+                        color: #455a64; padding: 4px 0;
+                        user-select: none; }
+.tmc-settings summary:hover { color: #1976d2; }
+.tmc-settings-table { width: 100%%; margin-top: 12px;
+                      border-collapse: collapse; }
+.tmc-settings-table th { background: #eceff1; padding: 6px 10px;
+                         border: 1px solid #cfd8dc;
+                         font-size: 12px; }
+.tmc-settings-table td { padding: 4px 10px;
+                         border: 1px solid #eceff1;
+                         font-size: 12px; }
 .footer { text-align: center; color: #666; padding: 20px;
           font-size: 13px; }
 .footer a { color: #1976d2; }
@@ -716,6 +768,7 @@ th { background: #f5f5f5; }
      target="_blank">YouTube: @crydteamprinting</a></p>
 
 <div class="meta">%(meta_html)s</div>
+%(tmc_settings_html)s
 %(summary_html)s
 
 <div class="chart-container">
@@ -825,6 +878,7 @@ new Chart(document.getElementById('sgChart'), {
             'mode': mode,
             'mode_upper': mode.upper(),
             'meta_html': meta_html,
+            'tmc_settings_html': tmc_settings_html,
             'summary_html': summary_html,
             'sg_label': sg_label,
             'data_table': table,
@@ -1021,90 +1075,111 @@ new Chart(document.getElementById('sgChart'), {
             return None
 
         prev_flow = results[-2].get('flow', 0)
-        if target_flow < prev_flow - 0.001:
-            return None  # bisection going down: don't trigger
+        going_up = target_flow >= prev_flow - 0.001
+        # SG trend triggers (snap-back, abnormal jump) are direction-
+        # sensitive — they require a monotonic up-sweep to compare
+        # against. Bisection probes can step DOWN, so we skip the
+        # trend triggers in that case but still run the
+        # direction-independent CV-spike and IQR-spread checks.
 
-        # Raw step-to-step SG deltas from recent history.
-        sg_deltas = []
-        for j in range(max(1, len(results) - 5), len(results) - 1):
-            rj, rj_prev = results[j], results[j-1]
-            if rj.get('sg') and rj_prev.get('sg'):
-                sg_deltas.append(
-                    rj['sg']['median'] - rj_prev['sg']['median'])
+        # ─── Trend-direction triggers (snap-back / over-jump / plateau)
+        # ─── only valid during monotonic up-sweep (coarse phase). In
+        # ─── bisection, the trend baseline is meaningless because we
+        # ─── jump around the slip point.
+        if going_up:
+            # Raw step-to-step SG deltas from recent history.
+            sg_deltas = []
+            for j in range(max(1, len(results) - 5), len(results) - 1):
+                rj, rj_prev = results[j], results[j-1]
+                if rj.get('sg') and rj_prev.get('sg'):
+                    sg_deltas.append(
+                        rj['sg']['median'] - rj_prev['sg']['median'])
 
-        if len(sg_deltas) < 3:
-            return None
+            if len(sg_deltas) >= 3:
+                expected_delta = sum(sg_deltas) / len(sg_deltas)
+                actual_delta = sg_med - results[-2]['sg']['median']
 
-        expected_delta = sum(sg_deltas) / len(sg_deltas)
-        actual_delta = sg_med - results[-2]['sg']['median']
+                # Trend direction (+1 = SG rises with load, -1 = SG falls
+                # with load, 0 = flat / inconclusive). Use 1 raw unit as
+                # the noise-floor so a tiny non-zero average doesn't lock
+                # us into a spurious sign.
+                if expected_delta > 1.0:
+                    trend_sign = +1
+                elif expected_delta < -1.0:
+                    trend_sign = -1
+                else:
+                    trend_sign = 0
 
-        # Trend direction (+1 = SG rises with load, -1 = SG falls with
-        # load, 0 = flat / inconclusive). Use 1 raw unit as the
-        # noise-floor so a tiny non-zero average doesn't lock us into a
-        # spurious sign.
-        if expected_delta > 1.0:
-            trend_sign = +1
-        elif expected_delta < -1.0:
-            trend_sign = -1
-        else:
-            trend_sign = 0
+                # In trend-direction terms, slip can manifest two ways:
+                #   • "Over-jump"   — load_signal jumps in the same
+                #                      direction as the trend, but >2×
+                #                      the typical step. This is what
+                #                      TMC2240/2209 (SG4) often show
+                #                      empirically: SG keeps rising but
+                #                      suddenly MUCH faster than before.
+                #   • "Snap-back"   — load_signal moves OPPOSITE to the
+                #                      trend (motor decouples, SG returns
+                #                      toward its no-load value). This is
+                #                      the textbook SG2 stall signature
+                #                      seen on TMC5160 etc.
+                # Both should fire; we test each independently.
+                if trend_sign != 0:
+                    expected_load = expected_delta * trend_sign     # > 0
+                    actual_load = actual_delta * trend_sign         # any sign
 
-        # In trend-direction terms, slip can manifest two ways:
-        #   • "Over-jump"   — load_signal jumps in the same direction as
-        #                      the trend, but >2× the typical step. This
-        #                      is what TMC2240/2209 (SG4) often show
-        #                      empirically: SG keeps rising but suddenly
-        #                      MUCH faster than before.
-        #   • "Snap-back"   — load_signal moves OPPOSITE to the trend
-        #                      (motor decouples, SG returns toward its
-        #                      no-load value). This is the textbook SG2
-        #                      stall signature seen on TMC5160 etc.
-        # Both should fire; we test each independently.
-        if trend_sign != 0:
-            expected_load = expected_delta * trend_sign     # > 0
-            actual_load = actual_delta * trend_sign         # any sign
+                    # Snap-back (slip via decoupling)
+                    if (actual_load < -expected_load
+                            and abs(actual_delta)
+                            > self._sg_jump_threshold()):
+                        if trend_sign > 0:
+                            return ("%s reload jump: %+.0f (expected to "
+                                    "keep rising ~+%.0f) — slip detected"
+                                    % (sg_label, actual_delta,
+                                       expected_load))
+                        return ("%s reload jump: %+.0f (expected to keep "
+                                "falling ~-%.0f) — slip detected"
+                                % (sg_label, actual_delta, expected_load))
 
-            # Snap-back (slip via decoupling)
-            if (actual_load < -expected_load
-                    and abs(actual_delta) > self._sg_jump_threshold()):
-                if trend_sign > 0:
-                    return ("%s reload jump: %+.0f (expected to keep "
-                            "rising ~+%.0f) — slip detected"
-                            % (sg_label, actual_delta, expected_load))
-                return ("%s reload jump: %+.0f (expected to keep "
-                        "falling ~-%.0f) — slip detected"
-                        % (sg_label, actual_delta, expected_load))
+                    # Over-jump (slip via abnormal acceleration)
+                    if (actual_load > expected_load * 2.0
+                            and abs(actual_delta)
+                            > self._sg_jump_threshold()):
+                        if trend_sign > 0:
+                            return ("%s abnormal jump: %+.0f vs expected "
+                                    "~+%.0f (%.1fx larger) — slip detected"
+                                    % (sg_label, actual_delta,
+                                       expected_load,
+                                       actual_load / expected_load))
+                        return ("%s abnormal drop: %+.0f vs expected "
+                                "~-%.0f (%.1fx larger) — slip detected"
+                                % (sg_label, actual_delta, expected_load,
+                                   actual_load / expected_load))
 
-            # Over-jump (slip via abnormal acceleration)
-            if (actual_load > expected_load * 2.0
-                    and abs(actual_delta) > self._sg_jump_threshold()):
-                if trend_sign > 0:
-                    return ("%s abnormal jump: %+.0f vs expected "
-                            "~+%.0f (%.1fx larger) — slip detected"
-                            % (sg_label, actual_delta, expected_load,
-                               actual_load / expected_load))
-                return ("%s abnormal drop: %+.0f vs expected ~-%.0f "
-                        "(%.1fx larger) — slip detected"
-                        % (sg_label, actual_delta, expected_load,
-                           actual_load / expected_load))
+                    # Trigger 2: plateau over 2 steps, only meaningful
+                    # when the trend is sizeable. Threshold at 0.5 —
+                    # anything tighter gives false positives on
+                    # naturally asymptotic SG curves where each step
+                    # falls by a smaller increment than the last.
+                    if expected_load > 5:
+                        prev_actual = (results[-2]['sg']['median']
+                                       - results[-3]['sg']['median'])
+                        cumulative_load = (actual_load
+                                           + prev_actual * trend_sign)
+                        expected_2step = expected_load * 2
+                        if cumulative_load < expected_2step * 0.5:
+                            direction = ("rising" if trend_sign > 0
+                                         else "falling")
+                            return ("%s plateau over 2 steps: %s trend "
+                                    "stalled (only %.0f vs typical %.0f "
+                                    "load-units) — flow no longer "
+                                    "increasing motor load (slip starting)"
+                                    % (sg_label, direction,
+                                       cumulative_load, expected_2step))
 
-            # Trigger 2: plateau over 2 steps, only meaningful when the
-            # trend is sizeable.
-            if expected_load > 5:
-                prev_actual = (results[-2]['sg']['median']
-                               - results[-3]['sg']['median'])
-                cumulative_load = (actual_load
-                                   + prev_actual * trend_sign)
-                expected_2step = expected_load * 2
-                if cumulative_load < expected_2step * 0.5:
-                    direction = ("rising" if trend_sign > 0
-                                 else "falling")
-                    return ("%s plateau over 2 steps: %s trend stalled "
-                            "(only %.0f vs typical %.0f load-units) — "
-                            "flow no longer increasing motor load "
-                            "(slip starting)"
-                            % (sg_label, direction,
-                               cumulative_load, expected_2step))
+        # ─── Direction-independent triggers (always evaluated) ───
+        # CV-spike and IQR-spread fire on the per-step variance signal
+        # itself, not on a trend baseline, so they make sense for both
+        # coarse and bisection probes.
 
         # Trigger 3: run-to-run CV spike. Intermittent slip shows up as
         # a sudden burst of variance between repeats at the same flow,
@@ -1115,57 +1190,340 @@ new Chart(document.getElementById('sgChart'), {
         if cv_reason:
             return cv_reason
 
+        # Trigger 4: IQR/spread anomaly. Catches "quiet" stalls where
+        # the median looks normal but the distribution widens (brief
+        # intermittent stall absorbed by median over 5 repeats).
+        iqr_reason = self._check_iqr_spread(results, sg_label)
+        if iqr_reason:
+            return iqr_reason
+
         return None
 
     def _check_cv_spike(self, results, sg_label):
         """Detect a run-to-run CV spike — intermittent slip signature.
 
-        A clean motor produces tight repeats (CV < 5%). When the motor
+        A clean motor produces tight repeats (CV usually <3% on stable
+        SG2 setups, may go up to 5% on noisier SG4). When the motor
         starts intermittently slipping, individual repeats diverge
         sharply, even if the median across all samples looks 'normal'.
-        We require:
-          - latest CV >= 10% (elevated in absolute terms)
-          - latest CV >= 2x the average of the previous 3 CVs (jump)
-          - at least 4 prior steps with CV data (statistical baseline)
+
+        Triggers (any one fires):
+          (a) "high-variance trip" — last CV >= 10% absolute (regardless
+              of baseline). Catches sudden chaotic slip.
+          (b) "low-baseline jump"  — last CV >= ratio * avg of prior
+              N steps AND last CV >= absolute floor. Ratio and floor
+              are tighter in coarse, looser in bisection (where we're
+              already near slip).
+          (c) "rising CV trend"   — CV grew across 2 consecutive
+              steps (each >=1.3x prior).
+          (d) "bisection absolute" — in bisection / verify, ANY CV
+              >= 2x the *coarse-phase median CV* (or >= 5% absolute,
+              whichever is higher). Catches the case where
+              intermittent slip already started during coarse and
+              "polluted" the immediate baseline, making patterns (b)
+              and (c) under-react.
+
+        Baseline strategy: when we're in bisection/verify, the most
+        meaningful baseline is the *coarse phase* — it represents the
+        clean, slip-free motor behaviour. Using only the immediate 3
+        prior steps as baseline lets earlier elevated bisection CVs
+        raise the threshold and mask later anomalies.
         """
         last = results[-1]
         last_rc = last.get('run_consistency') or {}
         if 'sg_cv' not in last_rc:
             return None
         last_cv = last_rc['sg_cv']
-        if last_cv < 10.0:
-            return None
 
+        last_phase = last.get('phase', 'coarse')
+        in_bisection = last_phase in ('bisect', 'verify')
+
+        # Build two baselines:
+        #   - "immediate": last 3 steps regardless of phase (sensitive
+        #     to recent trend)
+        #   - "coarse": median of CVs from the COARSE phase only
+        #     (slip-free reference, only available once we have data)
         prior_cvs = []
-        for r in results[-4:-1]:  # the 3 immediately prior steps
+        for r in results[-4:-1]:
             rc = r.get('run_consistency') or {}
             if 'sg_cv' in rc:
                 prior_cvs.append(rc['sg_cv'])
+
+        coarse_cvs = []
+        for r in results[:-1]:
+            if r.get('phase', 'coarse') != 'coarse':
+                continue
+            rc = r.get('run_consistency') or {}
+            if 'sg_cv' in rc:
+                coarse_cvs.append(rc['sg_cv'])
+        # Median of coarse CVs, excluding the LAST coarse step (which
+        # may be the elevated step that triggered bisection).
+        coarse_baseline_cv = None
+        if len(coarse_cvs) >= 4:
+            sorted_cv = sorted(coarse_cvs[:-1])
+            n = len(sorted_cv)
+            coarse_baseline_cv = (sorted_cv[n // 2] if n % 2
+                                  else (sorted_cv[n // 2 - 1]
+                                        + sorted_cv[n // 2]) / 2)
+
+        # Pattern (a): high-variance trip — works without baseline
+        if last_cv >= 10.0:
+            if not prior_cvs:
+                return ("run-to-run %s CV spiked to %.1f%% — repeats "
+                        "diverging, intermittent slip"
+                        % (sg_label, last_cv))
+            avg_prior_cv = sum(prior_cvs) / len(prior_cvs)
+            if last_cv >= 1.5 * avg_prior_cv:
+                return ("run-to-run %s CV spiked to %.1f%% (baseline "
+                        "~%.1f%% over previous 3 steps) — repeats "
+                        "diverging, intermittent slip"
+                        % (sg_label, last_cv, avg_prior_cv))
+
         if len(prior_cvs) < 3:
             return None
-
         avg_prior_cv = sum(prior_cvs) / len(prior_cvs)
-        if last_cv >= 2.0 * avg_prior_cv:
-            return ("run-to-run %s CV spiked to %.1f%% (baseline "
-                    "~%.1f%% over previous 3 steps) — repeats "
+
+        # Pattern (b): low-baseline jump vs immediate prior
+        b_ratio = 2.0 if in_bisection else 2.5
+        b_min_cv = 4.0 if in_bisection else 5.0
+        if last_cv >= b_min_cv and last_cv >= b_ratio * avg_prior_cv:
+            return ("run-to-run %s CV jumped to %.1f%% (%.1fx baseline "
+                    "of %.1f%% over previous 3 steps) — repeats "
                     "diverging, intermittent slip"
-                    % (sg_label, last_cv, avg_prior_cv))
+                    % (sg_label, last_cv,
+                       last_cv / avg_prior_cv, avg_prior_cv))
+
+        # Pattern (c): rising CV trend across 2 consecutive steps.
+        c_min_cv = 4.0 if in_bisection else 5.0
+        if (last_cv >= c_min_cv
+                and len(prior_cvs) >= 2
+                and prior_cvs[-1] >= 1.3 * prior_cvs[-2]
+                and last_cv >= 1.3 * prior_cvs[-1]
+                and prior_cvs[-1] >= 2.5):
+            return ("run-to-run %s CV rising across 3 steps "
+                    "(%.1f%% → %.1f%% → %.1f%%) — gradual slip onset"
+                    % (sg_label, prior_cvs[-2], prior_cvs[-1], last_cv))
+
+        # Pattern (d): bisection absolute vs coarse baseline.
+        # In bisection/verify, compare against the slip-free coarse
+        # phase median. This catches cases where one elevated bisect
+        # step has already pulled the immediate baseline up, masking
+        # subsequent elevated values.
+        if (in_bisection
+                and coarse_baseline_cv is not None
+                and last_cv >= 5.0
+                and last_cv >= 2.0 * coarse_baseline_cv):
+            return ("run-to-run %s CV %.1f%% in bisection vs coarse-"
+                    "phase baseline %.1f%% (%.1fx) — slip signature "
+                    "above clean-extrusion noise floor"
+                    % (sg_label, last_cv, coarse_baseline_cv,
+                       last_cv / coarse_baseline_cv))
+
+        return None
+
+    def _check_iqr_spread(self, results, sg_label):
+        """Detect an IQR/spread anomaly — quiet stall signature.
+
+        Sometimes a motor stalls briefly (start or end of move) and
+        recovers, leaving a median that looks normal but a wider
+        distribution. The IQR (P75-P25) widens when this happens.
+
+        Three triggers, in order:
+          (a) "ratio vs immediate" — current IQR >= ratio * avg of
+              prior 3 IQRs. Ratio is 3.0 in coarse, 1.7 in bisection.
+          (b) "ratio vs coarse baseline" (bisection only) — current
+              IQR >= 2.0 * the median IQR from the COARSE phase.
+              Catches cases where earlier elevated bisect IQRs have
+              raised the immediate baseline and masked subsequent
+              anomalies.
+          (c) "absolute" — current IQR >= 25 raw units in bisection /
+              verify. A motor near slip should have median, P25 and
+              P75 within a few units of each other; an IQR of 25+
+              indicates intermittent stall regardless of context.
+        """
+        last = results[-1]
+        sg_stats = last.get('sg') or {}
+        if 'p25' not in sg_stats or 'p75' not in sg_stats:
+            return None
+        last_iqr = sg_stats['p75'] - sg_stats['p25']
+
+        prior_iqrs = []
+        for r in results[-4:-1]:
+            sg_p = r.get('sg') or {}
+            if 'p25' in sg_p and 'p75' in sg_p:
+                prior_iqrs.append(sg_p['p75'] - sg_p['p25'])
+
+        last_phase = last.get('phase', 'coarse')
+        in_bisection = last_phase in ('bisect', 'verify')
+
+        # (c) absolute — fires unconditionally on any genuinely large
+        # IQR during bisection / verify. Cheap and reliable.
+        if in_bisection and last_iqr >= 25:
+            return ("%s spread widened: IQR %.0f raw units in %s — "
+                    "samples no longer cluster, intermittent stall"
+                    % (sg_label, last_iqr, last_phase))
+
+        if len(prior_iqrs) < 3:
+            return None
+        avg_prior_iqr = sum(prior_iqrs) / len(prior_iqrs)
+        if avg_prior_iqr < 1:
+            return None
+
+        # (a) ratio vs immediate prior steps
+        ratio_threshold = 1.7 if in_bisection else 3.0
+        if last_iqr >= 12 and last_iqr >= ratio_threshold * avg_prior_iqr:
+            return ("%s spread widened: IQR %.0f vs baseline ~%.0f "
+                    "(%.1fx) — quiet/intermittent stall in samples"
+                    % (sg_label, last_iqr, avg_prior_iqr,
+                       last_iqr / avg_prior_iqr))
+
+        # (b) ratio vs coarse baseline (bisection only)
+        if in_bisection:
+            coarse_iqrs = []
+            for r in results[:-1]:
+                if r.get('phase', 'coarse') != 'coarse':
+                    continue
+                sg_p = r.get('sg') or {}
+                if 'p25' in sg_p and 'p75' in sg_p:
+                    coarse_iqrs.append(sg_p['p75'] - sg_p['p25'])
+            if len(coarse_iqrs) >= 4:
+                # Median of all but the last coarse step (which may be
+                # the elevated step that triggered bisection).
+                sorted_iqr = sorted(coarse_iqrs[:-1])
+                n = len(sorted_iqr)
+                median_coarse_iqr = (sorted_iqr[n // 2] if n % 2
+                                     else (sorted_iqr[n // 2 - 1]
+                                           + sorted_iqr[n // 2]) / 2)
+                # Require both ratio AND absolute delta — small
+                # baselines (e.g. 6 raw units) shouldn't trigger on a
+                # 14-unit IQR at the natural bisection noise floor.
+                if (median_coarse_iqr >= 1
+                        and last_iqr >= 18
+                        and last_iqr >= 2.5 * median_coarse_iqr):
+                    return ("%s spread IQR %.0f in %s vs coarse-phase "
+                            "median IQR ~%.0f (%.1fx) — slip widening "
+                            "above clean-extrusion noise"
+                            % (sg_label, last_iqr, last_phase,
+                               median_coarse_iqr,
+                               last_iqr / median_coarse_iqr))
+
+        return None
+
+    def _is_borderline(self, results):
+        """Detect if the latest bisection step sits in a 'gray zone'
+        — not clearly safe but not clearly stalled either.
+
+        Returns a string explaining why it's borderline, or None if
+        the result is conclusive.
+
+        Used by the bisection loop to decide whether to re-test the
+        same flow before classifying it as safe or as a trigger.
+
+        Heuristic: look at CV and IQR vs the coarse-phase baselines.
+        Confidence ranges:
+          - CV in coarse: typically 1-3% on a stable SG2 setup
+          - CV >= 7% in bisection AND >= 3x coarse baseline: clearly slip
+          - CV < 4% in bisection: clearly safe
+          - CV in 4-6.9% range, OR 2-3x coarse baseline: BORDERLINE
+          - IQR >= 25 in bisection: clearly slip (already trigger (c))
+          - IQR < 15: clearly safe
+          - IQR 15-24: BORDERLINE
+        """
+        if not results:
+            return None
+        last = results[-1]
+        if last.get('phase') not in ('bisect', 'verify'):
+            return None
+        last_rc = last.get('run_consistency') or {}
+        last_cv = last_rc.get('sg_cv')
+        sg_stats = last.get('sg') or {}
+        if 'p25' not in sg_stats or 'p75' not in sg_stats:
+            return None
+        last_iqr = sg_stats['p75'] - sg_stats['p25']
+
+        # Build coarse-phase reference
+        coarse_cvs = []
+        coarse_iqrs = []
+        for r in results[:-1]:
+            if r.get('phase', 'coarse') != 'coarse':
+                continue
+            rc = r.get('run_consistency') or {}
+            sg_p = r.get('sg') or {}
+            if 'sg_cv' in rc:
+                coarse_cvs.append(rc['sg_cv'])
+            if 'p25' in sg_p and 'p75' in sg_p:
+                coarse_iqrs.append(sg_p['p75'] - sg_p['p25'])
+        if len(coarse_cvs) < 4:
+            return None  # not enough baseline for comparison
+
+        # Use median-of-coarse (excluding last coarse step which may be
+        # the elevated one that triggered bisection)
+        sorted_cv = sorted(coarse_cvs[:-1])
+        n = len(sorted_cv)
+        coarse_med_cv = (sorted_cv[n // 2] if n % 2
+                         else (sorted_cv[n // 2 - 1]
+                               + sorted_cv[n // 2]) / 2)
+        sorted_iqr = sorted(coarse_iqrs[:-1])
+        n = len(sorted_iqr)
+        coarse_med_iqr = (sorted_iqr[n // 2] if n % 2
+                          else (sorted_iqr[n // 2 - 1]
+                                + sorted_iqr[n // 2]) / 2)
+
+        # CV gray zone: elevated but not screaming
+        cv_borderline = (last_cv is not None
+                         and 4.0 <= last_cv < 7.0
+                         and (coarse_med_cv < 1
+                              or last_cv >= 1.5 * coarse_med_cv))
+
+        # IQR gray zone: wide but not extreme
+        iqr_borderline = (15 <= last_iqr < 25
+                          and (coarse_med_iqr < 1
+                               or last_iqr >= 1.7 * coarse_med_iqr))
+
+        if cv_borderline and iqr_borderline:
+            return ("CV %.1f%% (vs coarse ~%.1f%%) AND IQR %.0f "
+                    "(vs coarse ~%.0f) both in borderline range"
+                    % (last_cv, coarse_med_cv,
+                       last_iqr, coarse_med_iqr))
+        if cv_borderline:
+            return ("CV %.1f%% in borderline range (coarse baseline "
+                    "~%.1f%%, clear trigger >=7%%)"
+                    % (last_cv, coarse_med_cv))
+        if iqr_borderline:
+            return ("IQR %.0f in borderline range (coarse baseline "
+                    "~%.0f, clear trigger >=25)"
+                    % (last_iqr, coarse_med_iqr))
         return None
 
     def _check_triggers_cs(self, results, baseline_cs):
-        """CoolStep + SG triggers (Mode A + B fallback).
+        """CoolStep + SG triggers — robust for ACTIVE CoolStep regulation.
 
         AUTO-DETECTS whether CoolStep is actually changing CS_ACTUAL.
         If CS is essentially static (range < 1.0), falls back to SG-only.
 
-        CS-based triggers (when CoolStep is active):
-          A1. CS jump UP >=+5: sudden load → approaching slip
-          A2. CS leaves regulation (CS<deep_reg → CS>=deep_reg)
-          A3. CS drop >5 (hard stall: motor lost load)
-        SG fallback (always):
-          B1. SG abnormal jump (>2x expected, >+15)
+        --- Background ---
+        When CoolStep is actively regulating across the test flow range,
+        CS rises gradually with load (e.g. 8 → 15 → 22 → 28 → 31). This
+        is NORMAL behaviour, not slip — but the old "+5 step jump"
+        heuristic interpreted every regulation step as slip.
 
-        deep_reg = baseline_cs + 5 (dynamic, depends on hardware)
+        New trigger philosophy: a CS-jump alone is NOT a slip indicator
+        when CoolStep is active. A real slip event is characterized by:
+          (1) CS reaches FULL maximum (≥ 30) — not just "up a bit"
+          (2) Previously CS was actually regulating below max (proves
+              CoolStep wasn't already pegged from the start)
+          (3) Confirmation from a second signal:
+              - SG drops sharply (>=30% vs prior step), OR
+              - run-to-run CV spikes, OR
+              - SG snap-back / over-jump signature
+
+        CS-based triggers (when CoolStep is active):
+          A1. CS pegged at max + SG sharp drop — confirmed slip
+          A2. CS pegged at max + CV spike — intermittent slip
+          A3. CS hard drop after regulation — motor lost load contact
+        SG triggers (always evaluated):
+          B1. Snap-back / over-jump (data-driven trend detection)
+          B2. CV spike (from _check_cv_spike helper)
         """
         if not results or len(results) < 3:
             return None
@@ -1190,46 +1548,82 @@ new Chart(document.getElementById('sgChart'), {
 
         prev_flow = results[-2].get('flow', 0)
         going_up_or_same = target_flow >= prev_flow - 0.001
+        # Bisection / verify probe flows in arbitrary order, so the
+        # going_up_or_same gate (which exists to suppress false-
+        # positives during the monotonically-increasing coarse sweep)
+        # must NOT block triggers in those phases. A stall is a stall
+        # regardless of whether the previous probe was higher or lower.
+        last_phase = results[-1].get('phase', 'coarse')
+        in_bisection = last_phase in ('bisect', 'verify')
+        evaluate_triggers = going_up_or_same or in_bisection
 
         cs_med = cs_stats['median']
         sg_med = sg_stats['median'] if sg_stats and sg_stats['n'] > 0 else None
         sg_label = self._get_sg_label()
 
-        # ─── CoolStep-based triggers ───
-        if coolstep_active:
-            if baseline_cs is not None and baseline_cs > 0:
-                CS_DEEP_REG = baseline_cs + 5.0
-                cs_elevated = baseline_cs + 3.0
-            else:
-                CS_DEEP_REG = 22.0
-                cs_elevated = 17.0
+        # ─── CoolStep-based triggers (only when CS actually regulates) ───
+        # Use stricter thresholds when CoolStep is active to avoid
+        # false-positives from normal regulation transitions.
+        CS_FULL_MAX = 30.0      # CS_ACTUAL=31 is hardware max for TMC drivers
+        CS_REGULATING_HIGH = 25.0  # below this = CoolStep was actively regulating
 
+        if coolstep_active:
             cs_step_change = cs_med - prev_cs['median']
 
-            # A1: CS jump UP >=+5
-            if (going_up_or_same
-                    and prev_cs['median'] < CS_DEEP_REG
-                    and cs_step_change >= 5.0):
-                return ("CS_ACTUAL jumped +%.1f in one step "
-                        "(median %.1f → %.1f) — sudden load increase, "
-                        "motor approaching limit"
-                        % (cs_step_change, prev_cs['median'], cs_med))
+            # Check: was CS regulating below the high threshold within
+            # the recent history? (Not just the immediately previous step
+            # — gradual ramp-up like 22→28→31 should still count as
+            # "transitioned to max from regulation".)
+            recent_cs_was_regulating = any(
+                r_.get('cs') and r_['cs']['median'] < CS_REGULATING_HIGH
+                for r_ in results[-4:-1]  # last 3 steps before current
+            )
 
-            # A2: CS leaves regulation
-            if (going_up_or_same
-                    and prev_cs['median'] < CS_DEEP_REG
-                    and cs_med >= CS_DEEP_REG
-                    and cs_step_change >= 3.0):
-                return ("CS_ACTUAL left deep regulation: %.1f → %.1f "
-                        "(threshold %.0f) — motor approaching limit"
-                        % (prev_cs['median'], cs_med, CS_DEEP_REG))
+            # A1: CS pegged at max + SG sharp drop (the canonical slip signature)
+            #     - Current CS at maximum (>= 30)
+            #     - CS was actually regulating recently (proves we
+            #       weren't already pegged for the entire run)
+            #     - SG dropped >= 30% vs previous step (load really increased)
+            if (evaluate_triggers
+                    and cs_med >= CS_FULL_MAX
+                    and recent_cs_was_regulating
+                    and sg_med is not None
+                    and results[-2].get('sg')
+                    and results[-2]['sg'].get('median') is not None
+                    and results[-2]['sg']['median'] > 0):
+                prev_sg = results[-2]['sg']['median']
+                sg_drop_pct = (prev_sg - sg_med) / prev_sg * 100.0
+                if sg_drop_pct >= 30.0:
+                    return ("CS_ACTUAL pegged at max (%.0f → %.0f) "
+                            "AND %s dropped %.0f%% (%.0f → %.0f) — "
+                            "load suddenly increased to limit, slip "
+                            "detected"
+                            % (prev_cs['median'], cs_med,
+                               sg_label, sg_drop_pct, prev_sg, sg_med))
 
-            # A3: CS hard drop
-            if (going_up_or_same
-                    and prev_cs['median'] > cs_elevated
-                    and cs_step_change < -5.0):
+            # A2: CS pegged at max + CV spike (intermittent slip)
+            #     CoolStep regulated then suddenly maxed, AND repeats
+            #     started diverging — clear sign of intermittent slip.
+            if (evaluate_triggers
+                    and cs_med >= CS_FULL_MAX
+                    and recent_cs_was_regulating):
+                last_rc = r.get('run_consistency') or {}
+                last_cv = last_rc.get('sg_cv', 0)
+                if last_cv >= 5.0:
+                    cv_reason = self._check_cv_spike(results, sg_label)
+                    if cv_reason:
+                        return ("CS_ACTUAL pegged at max (%.0f → %.0f) "
+                                "AND %s"
+                                % (prev_cs['median'], cs_med, cv_reason))
+
+            # A3: CS hard drop after regulation (hard stall — motor decoupled)
+            #     CS dropped sharply after having been regulating.
+            #     Indicates motor lost contact with the load entirely.
+            if (evaluate_triggers
+                    and prev_cs['median'] >= CS_REGULATING_HIGH
+                    and cs_step_change < -8.0):
                 had_regulation = any(
-                    r_.get('cs') and r_['cs']['median'] < CS_DEEP_REG
+                    r_.get('cs') and r_['cs']['median'] < CS_REGULATING_HIGH
                     for r_ in results[:-1])
                 if had_regulation:
                     return ("CS_ACTUAL dropped %.1f in one step "
@@ -1237,8 +1631,13 @@ new Chart(document.getElementById('sgChart'), {
                             "motor lost load contact"
                             % (-cs_step_change, prev_cs['median'], cs_med))
 
-        # ─── SG fallback / backup ───
+        # ─── SG trend triggers (snap-back / over-jump) ───
+        # These are direction-sensitive and meaningful only during the
+        # monotonic up-sweep of coarse phase. In bisection we probe
+        # arbitrary flows, so the trend baseline is meaningless — we
+        # rely on CV-spike and IQR-spread (below) instead.
         if (going_up_or_same
+                and not in_bisection
                 and sg_med is not None
                 and sg_med > self._sg_min_informative()
                 and len(results) >= 4):
@@ -1248,12 +1647,12 @@ new Chart(document.getElementById('sgChart'), {
                 if not (rj.get('sg') and rj_prev.get('sg')
                         and rj.get('cs') and rj_prev.get('cs')):
                     continue
+                # When CoolStep is actively regulating, SG values can
+                # be biased by the changing current — exclude steps
+                # where CS was at max from the trend baseline.
                 if coolstep_active:
-                    deep_reg = (baseline_cs + 5.0
-                                if baseline_cs is not None
-                                and baseline_cs > 0 else 22.0)
-                    if (rj['cs']['median'] >= deep_reg
-                            or rj_prev['cs']['median'] >= deep_reg):
+                    if (rj['cs']['median'] >= CS_FULL_MAX
+                            or rj_prev['cs']['median'] >= CS_FULL_MAX):
                         continue
                 sg_deltas.append(
                     rj['sg']['median'] - rj_prev['sg']['median'])
@@ -1305,11 +1704,19 @@ new Chart(document.getElementById('sgChart'), {
                                    expected_load,
                                    actual_load / expected_load))
 
-        # CV spike fallback — also fires in CS mode
-        if going_up_or_same:
+        # CV spike fallback — also fires in CS mode (catches intermittent
+        # slip even when CS-based triggers above don't fire because
+        # CoolStep is regulating smoothly).
+        if evaluate_triggers:
             cv_reason = self._check_cv_spike(results, sg_label)
             if cv_reason:
                 return cv_reason
+
+            # IQR/spread anomaly fallback — catches "quiet" stalls
+            # where median is hidden but distribution widens.
+            iqr_reason = self._check_iqr_spread(results, sg_label)
+            if iqr_reason:
+                return iqr_reason
 
         return None
 
@@ -1400,6 +1807,66 @@ new Chart(document.getElementById('sgChart'), {
         except (KeyError, AttributeError):
             return 0
 
+    def _snapshot_tmc_settings(self):
+        """Read TMC register state most relevant to this test.
+
+        Captures only the fields that affect StallGuard / CoolStep
+        behaviour during the flow test, so the report has a short and
+        focused paper trail of the configuration that produced the
+        result. Missing fields are skipped silently.
+        """
+        snapshot = []
+        if self.tmc is None:
+            return snapshot
+
+        def get(name):
+            try:
+                return self.tmc.fields.get_field(name)
+            except (KeyError, AttributeError):
+                return None
+
+        def add(label, name):
+            v = get(name)
+            if v is None:
+                return
+            snapshot.append((label, str(v), name))
+
+        # Identity
+        snapshot.append(("Driver", str(self.driver_type or '?'),
+                         'driver_type'))
+        snapshot.append(("Stepper", str(self.stepper_name or '?'),
+                         'stepper_name'))
+
+        # Chopper mode (decides which StallGuard engine works)
+        add("en_pwm_mode (1=StealthChop)", 'en_pwm_mode')
+        add("en_spreadCycle (1=SpreadCycle, TMC2209)", 'en_spreadCycle')
+
+        # Velocity gates that govern StallGuard / CoolStep activity
+        add("TPWMTHRS (StealthChop velocity threshold)", 'tpwmthrs')
+        add("TCOOLTHRS (CoolStep / StallGuard velocity threshold)",
+            'tcoolthrs')
+        add("THIGH (full-step velocity threshold)", 'thigh')
+
+        # StallGuard sensitivity
+        add("SGTHRS (TMC2209 StallGuard4 threshold)", 'sgthrs')
+        add("SGT (StallGuard2 threshold, signed -64..+63)", 'sgt')
+        add("sg4_thrs (StallGuard4 threshold, TMC2240)", 'sg4_thrs')
+        add("sg4_filt_en (SG4 filter enabled)", 'sg4_filt_en')
+        add("SFILT (SG2 filter enabled)", 'sfilt')
+
+        # CoolStep configuration
+        add("SEMIN (CoolStep lower threshold = SEMIN*32)", 'semin')
+        add("SEMAX (CoolStep upper threshold offset)", 'semax')
+        add("SEUP (current-up step size)", 'seup')
+        add("SEDN (current-down step size)", 'sedn')
+        add("SEIMIN (CoolStep min current; 0=1/2 IRUN, 1=1/4)",
+            'seimin')
+
+        # Run-time current state
+        add("IRUN (run current scale 0..31)", 'irun')
+
+        return snapshot
+
     # ─── Main commands ──────────────────────────────────────────────
 
     def cmd_TMC_FLOW_FIND_MAX(self, gcmd):
@@ -1479,7 +1946,7 @@ new Chart(document.getElementById('sgChart'), {
         verify_repeats = gcmd.get_int(
             'VERIFY_REPEATS', 5, minval=1, maxval=10)
         purge = gcmd.get_float('PURGE', 0.0, minval=0.)
-        cooldown = gcmd.get_float('COOLDOWN', 60.0, minval=0., maxval=300.)
+        cooldown = gcmd.get_float('COOLDOWN', 15.0, minval=0., maxval=300.)
         max_bisect = gcmd.get_int(
             'MAX_BISECT_STEPS', 6, minval=2, maxval=15)
         no_html = gcmd.get_int('NO_HTML', 0, minval=0, maxval=1)
@@ -1549,6 +2016,7 @@ new Chart(document.getElementById('sgChart'), {
             'flow_range': '%.1f → %.1f mm³/s (adaptive)' % (
                 start_flow, max_flow),
             'step_duration': '%.1f s' % step_duration,
+            'tmc_settings': self._snapshot_tmc_settings(),
         }
 
         # ─── Banner ───
@@ -1664,11 +2132,16 @@ new Chart(document.getElementById('sgChart'), {
         gcmd.respond_info(
             "\n>>> Phase 2: Bisection <<<\n"
             "  Narrowing [%.0f, %.0f] by halving until interval ≤ %.0f. "
-            "Up to %d steps."
+            "Up to %d steps.\n"
+            "  Borderline measurements (CV 4-7%% or IQR 15-24) are "
+            "re-tested once for confirmation."
             % (low, high, min_step, max_bisect))
 
         bisect_iter = 0
         last_trigger_reason = first_trigger_reason
+        # Track which flows we've already re-tested to avoid infinite
+        # loops on persistently-borderline values.
+        retested_flows = set()
         while (high - low) > min_step + 0.001 and bisect_iter < max_bisect:
             bisect_iter += 1
             raw_mid = (low + high) / 2.0
@@ -1678,6 +2151,43 @@ new Chart(document.getElementById('sgChart'), {
 
             r = measure_and_save(mid, 'bisect')
             reason = check(results)
+
+            # Borderline check: if no clear trigger fired but the data
+            # sits in the gray zone, re-measure once before classifying.
+            # Re-test ONLY if (a) no trigger fired (otherwise we already
+            # have a decision) and (b) we haven't already re-tested
+            # this same flow.
+            if (reason is None
+                    and mid not in retested_flows):
+                borderline_why = self._is_borderline(results)
+                if borderline_why:
+                    retested_flows.add(mid)
+                    gcmd.respond_info(
+                        "  >>> %.1f mm³/s BORDERLINE — %s\n"
+                        "      Re-measuring once for confirmation..."
+                        % (mid, borderline_why))
+                    if cooldown > 0:
+                        self.gcode.run_script_from_command(
+                            "G4 P%d" % int(cooldown * 1000))
+                    # Drop the borderline measurement from the results
+                    # list and replace with the fresh one. This keeps
+                    # the trend baselines clean (one entry per flow).
+                    results.pop()
+                    r2 = measure_and_save(mid, 'bisect')
+                    reason = check(results)
+                    # If second pass is clearly safer, classify as safe.
+                    # If second pass also borderline (or worse) AND any
+                    # of CV/IQR is at upper end of gray zone, treat as
+                    # trigger to err on the safe side.
+                    if reason is None:
+                        re_borderline = self._is_borderline(results)
+                        if re_borderline:
+                            # Two consecutive borderline measurements at
+                            # the same flow → confirm it's not noise,
+                            # treat as trigger.
+                            reason = ("borderline confirmed on re-test: "
+                                      + re_borderline)
+
             if reason:
                 high = mid
                 last_trigger_reason = reason
