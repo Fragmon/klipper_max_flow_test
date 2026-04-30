@@ -28,6 +28,8 @@ Output: a CSV with raw data and an interactive HTML report with a **decision tra
 
 > **Important for TMC2240 users**: The plugin runs the TMC2240 in the **SG2/SpreadCycle path** (same as TMC5160). The TMC2240's SG4/StealthChop path delivers ~50 % less peak torque — it's intended for sensorless homing, not high-flow extrusion. See [TMC2240 config](#tmc2240) below.
 
+> **Important for TMC2209 users**: The TMC2209 has a **fundamental hardware limitation** that prevents StallGuard from working in SpreadCycle mode. This caps practical max-flow results at roughly half of what the same motor could produce on a TMC5160/2240. See [TMC2209 limitations](#tmc2209-limitations-important) below before configuring.
+
 ---
 
 ## Quick start
@@ -123,19 +125,25 @@ driver_SFILT: 1                  # SG2 filter — REQUIRED for clean signal
 
 #### TMC2209
 
+> ⚠️ **Read [TMC2209 limitations](#tmc2209-limitations-important) first.** The TMC2209 has a hardware constraint that significantly limits this plugin's effectiveness compared to TMC5160/2240. The plugin will run, but expect ~50 % lower max flow than the same motor would achieve on a TMC5160 or TMC2240.
+
 ```ini
 [tmc2209 extruder]
 uart_pin: PB12                   # ADAPT
-run_current: 0.85                # ADAPT
+run_current: 0.85                # ADAPT — see notes below
 hold_current: 0.6                # ADAPT
 sense_resistor: 0.110            # ADAPT
 interpolate: false
-stealthchop_threshold: 999999    # SG4 requires StealthChop
+stealthchop_threshold: 999999    # SG4 REQUIRES StealthChop — do not change
 coolstep_threshold: 0.5          # required for StallGuard reads
 driver_SGTHRS: 100               # SG4 sensitivity (0-255, higher = more sensitive)
 ```
 
-> **Note**: Auto-SGT is currently only supported for SG2 drivers (TMC5160, TMC2130, TMC2240). On TMC2209 the plugin uses your configured `driver_SGTHRS` value directly.
+**Why `stealthchop_threshold: 999999`?** TMC2209's StallGuard4 only works in StealthChop mode — there is no SG2 implementation in this chip. Setting threshold to `999999` keeps StealthChop active at all velocities (extrusion rarely exceeds this). See the limitations section below for the full hardware explanation.
+
+**Recommended `run_current` is HIGHER than for TMC5160/2240.** StealthChop loses roughly 50 % of peak torque compared to SpreadCycle. To partially compensate, set `run_current` 20-30 % higher than you'd normally use (e.g. 0.85 A on a Sherpa Mini pancake). Keep `hold_current` modest to avoid overheating during dwell.
+
+> **Note**: Auto-SGT is currently only supported for SG2 drivers (TMC5160, TMC2130, TMC2240). On TMC2209 the plugin uses your configured `driver_SGTHRS` value directly. Manual tuning guidance is in the [Troubleshooting](#troubleshooting) section.
 
 ### Plugin section
 
@@ -181,6 +189,74 @@ Each TMC chip family supports StallGuard only in one specific chopper mode:
 > **`stealthchop_threshold: 0` is NOT the same as "no line".** It enables StealthChop with threshold 0, which breaks SG2. For SG2 drivers, **remove the line entirely**.
 
 If you're not sure what mode you're in, run `TMC_FLOW_STATUS` — the plugin checks the configuration and tells you what's wrong. Or `DUMP_TMC STEPPER=extruder` and check `en_pwm_mode` (1 = StealthChop) and `tpwmthrs` (1048575 = pure SpreadCycle).
+
+---
+
+## TMC2209 limitations (important)
+
+The TMC2209 has a **fundamental hardware constraint** that makes it significantly less effective with this plugin than the TMC5160/2240. This isn't a plugin bug — it's a chip-level limitation that affects every Klipper-based StallGuard tool.
+
+### What's different about the TMC2209
+
+The TMC2209 chip family has only **one** StallGuard variant: **StallGuard4**. It does not implement StallGuard2 (the TMC5160/2240 variant). And StallGuard4 was designed by Trinamic to work **exclusively with StealthChop** — not SpreadCycle. From Trinamic's own [Application Note AN-002](https://www.analog.com/en/resources/app-notes/an-002.html):
+
+> *"StallGuard4 differs from StallGuard2 in multiple aspects. It uses the StealthChop voltage chopper and not SpreadCycle."*
+
+What this means in practice:
+
+| Driver | StallGuard variant | Works in SpreadCycle? | Works in StealthChop? |
+|---|---|---|---|
+| TMC5160 / TMC2130 | SG2 | ✅ Yes (designed for it) | ❌ No |
+| TMC2240 | SG2 + SG4 | ✅ Yes (SG2 path) | ✅ Yes (SG4 path, lower torque) |
+| TMC2209 | SG4 only | ❌ Returns 0 or noise | ✅ Yes |
+
+### The torque vs. signal trade-off
+
+You can run a stepper motor in either chopper mode, but each mode has different torque characteristics:
+
+- **SpreadCycle** delivers full peak torque (~100 %) — what you want for high-flow extrusion
+- **StealthChop** is silent but delivers ~50 % less peak torque at high speed
+
+For TMC5160/2240, you can have **both**: SG2 works in SpreadCycle, so you get full torque AND slip detection. For TMC2209, the choices are:
+
+- **StealthChop + SG4** → slip detection works, but you've capped your peak torque at ~50 %
+- **SpreadCycle + no SG** → full torque, but no way to detect slip (this plugin won't work)
+
+There's no third option that gives you both. Trinamic has confirmed this in their datasheet. Multiple GitHub issues ([TMCStepper #87](https://github.com/teemuatlut/TMCStepper/issues/87), [#190](https://github.com/teemuatlut/TMCStepper/issues/190), [#293](https://github.com/teemuatlut/TMCStepper/issues/293)) document attempts to read SG_RESULT in SpreadCycle on TMC2209 — the consistent result is `0` or wildly fluctuating noise.
+
+### What this means for your max-flow result
+
+A given motor (say, a Sherpa Mini LDO pancake) on:
+
+- **TMC5160 / TMC2240**: ~110-120 mm³/s (full SpreadCycle torque + reliable slip detection)
+- **TMC2209**: ~50-70 mm³/s (StealthChop's reduced torque is the actual physical limit)
+
+The plugin will run, the test will produce a valid number, and that number will reflect the genuine physical limit of your motor in StealthChop mode. It just won't reach the values your motor would achieve on a different driver.
+
+### How to get the most out of your TMC2209
+
+Three things help maximize what you can achieve:
+
+1. **Increase `run_current`.** StealthChop loses torque, so compensate. Pancake steppers on Sherpa Mini are often run at 0.5-0.7 A — try 0.85-1.0 A. Watch motor temperature; reduce `hold_current` if the motor gets hot during dwell.
+
+2. **Tune `driver_SGTHRS` carefully.** Auto-SGT doesn't currently work for SG4, so you'll need to do this manually. Start with 100. Run the test, watch the SG values in the console:
+   - SG saturating at 510 (max for SG4) → SGTHRS too high, lower it (try 60-80)
+   - SG hitting 0 quickly → SGTHRS too low, raise it (try 130-180)
+   - SG ranging 200-400 → good
+
+3. **Keep `interpolate: false`.** Microstep interpolation can interfere with StallGuard's load measurement. The TMC2209's native 1/16 microstepping is fine for extrusion.
+
+### Why doesn't the plugin support SG4 in SpreadCycle?
+
+We tested it. Empirically and from documentation: SG_RESULT in SpreadCycle on TMC2209 returns either `0` constantly or unstable values that have no correlation with actual motor load. There's no statistical signal that could be used for slip detection, and no software workaround can fix what's a chip-level limitation.
+
+If you have a TMC2209 board and want a flow-test with full SpreadCycle torque, your options are:
+
+- **Replace the driver with TMC2240** (pin-compatible on most boards, ~€15)
+- **Use a flow-tower print** instead — this is the traditional method and works regardless of driver
+- **Use [klipper_tmc_autotune](https://github.com/andrewmcgr/klipper_tmc_autotune)** to optimize your existing TMC2209 setup (it also runs in StealthChop)
+
+We did not include a SpreadCycle test mode for TMC2209 because shipping a feature that produces unreliable results would do more harm than good — users would tune their slicer based on phantom numbers and get failed prints.
 
 ---
 
@@ -297,10 +373,19 @@ The CSV header includes the same TMC settings block for paper-trail purposes.
 Remove the `stealthchop_threshold:` line entirely from your TMC section, `FIRMWARE_RESTART`. For TMC2240: also remove any `[delayed_gcode]` block that sets `sg4_thrs` or `sg4_filt_en` — they're not needed in SG2 mode.
 
 **`TMC_FLOW_STATUS` reports "StealthChop not active"** *(TMC2209 only)* —
-Add `stealthchop_threshold: 999999` to your `[tmc2209 extruder]` section, `FIRMWARE_RESTART`.
+Add `stealthchop_threshold: 999999` to your `[tmc2209 extruder]` section, `FIRMWARE_RESTART`. SG4 does not work in SpreadCycle (see [TMC2209 limitations](#tmc2209-limitations-important)).
 
 **`TMC_FLOW_STATUS` reports "SGTHRS is 0"** *(TMC2209 only)* —
 Add `driver_SGTHRS: 100` to your `[tmc2209 extruder]` section.
+
+**TMC2209 SG_RESULT shows 0 or wildly fluctuating values** —
+You're probably running in SpreadCycle (or have `stealthchop_threshold` set too low). SG4 only works in StealthChop on TMC2209 — this is a hardware limitation, not fixable in software. Set `stealthchop_threshold: 999999`. See [TMC2209 limitations](#tmc2209-limitations-important).
+
+**TMC2209 max-flow result much lower than expected** (50-60 mm³/s on a fast extruder) —
+This is expected and represents your motor's true capability in StealthChop mode. SG4 forces StealthChop, which costs ~50 % peak torque vs. SpreadCycle. Options:
+1. Increase `run_current` to 0.85-1.0 A (compensates partially)
+2. Switch to TMC2240 (pin-compatible on most boards) for SG2 + full SpreadCycle torque
+3. Accept the result — it's the actual physical limit at this driver's torque output
 
 **Auto-SGT can't reach target range** —
 Console says "could not reach target range" after 5 iterations. Usually means your SGT is at an extreme (e.g. -64 or +63) and still doesn't produce useful SG values. Check your `run_current` — if it's very low, even max-sensitive SGT may not see enough load. Try increasing `run_current` slightly or running with `AUTO_SGT=0` and a manually-chosen SGT.
