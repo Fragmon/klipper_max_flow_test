@@ -20,7 +20,7 @@ Plugin by **Steven (Fragmon) — Crydteam**
 The plugin uses the TMC driver's built-in **StallGuard** load-sensing feature to detect when the extruder motor is approaching slip. It runs an automatic three-phase bracket-bisection test:
 
 1. **Coarse sweep** — increase flow in big steps until StallGuard detects load approaching the limit
-2. **Bisection** — narrow the bracket by halving until the safe value is known to ±1 mm³/s
+2. **Bisection** — narrow the bracket by halving until the safe value is known to ±1 mm³/s, with automatic re-test of borderline measurements
 3. **Verification** — confirm the safe value with extra repetitions and report a stability metric
 
 Output is a CSV with raw data and an interactive HTML report.
@@ -83,7 +83,7 @@ The exact numbers don't have to match — what matters is that you have **at lea
 - Increase `coolstep_threshold` slightly (e.g. from `0.5` to `1.0`) — gates StallGuard above a minimum velocity, suppresses noise during ramps.
 - Enable the SG filter: `driver_SFILT: True` (TMC5160) or `driver_sg4_filt_en: True` (TMC2240). Smooths over 4 full-steps.
 
-**A tested reference for TMC5160** (Chube Air, Sherpa Mini, 0.85 A, PLA at 230 °C): `driver_SGT: 15` produces SG ≈ 540 at 20 mm³/s and SG ≈ 90 at 110 mm³/s. Use this as a starting point.
+**A tested reference for TMC5160** (Sherpa Mini, 0.85 A, PLA at 230 °C): `driver_SGT: 15` produces SG ≈ 540 at 20 mm³/s and SG ≈ 90 at 110 mm³/s. Use this as a starting point.
 
 See [StallGuard tuning](#2-stallguard-tuning) below for the complete tuning workflow.
 
@@ -135,7 +135,7 @@ TMC_FLOW_FIND_MAX
 
 That's it. The plugin auto-detects whether your driver has CoolStep enabled and picks the right test mode automatically.
 
-Test takes ~10 minutes by default. CSV and HTML report are saved to `~/printer_data/config/Flowtest/`.
+Test takes ~10 minutes by default (+30 – 60 s if borderline measurements need re-testing). CSV and HTML report are saved to `~/printer_data/config/Flowtest/`.
 
 ---
 
@@ -147,34 +147,57 @@ Slip detection layers several independent triggers — any one fires:
 
 ### Always-on triggers (work regardless of mode)
 
-**1. Snap-back.** During normal extrusion the SG signal trends in one direction with rising flow. When the motor decouples (slip), SG snaps sharply back toward its no-load value. The plugin learns the trend direction from the recent steps so this works for both SG2 (SG falls with load) and SG4 (SG often rises with load on extruders).
+**1. Snap-back.** During normal extrusion the SG signal trends in one direction with rising flow. When the motor decouples (slip), SG snaps sharply back toward its no-load value. The plugin learns the trend direction from the recent steps so this works for both SG2 (SG falls with load) and SG4 (SG often rises with load on extruders). *Coarse phase only — bisection probes flows in arbitrary order so trend baselines aren't meaningful.*
 
-**2. Over-jump.** SG moves in the trend direction, but much faster than the typical step (>2× expected, with a minimum jump of 5 raw units on SG2 / 15 on SG4). Sudden over-acceleration of the load signal — typical SG4 slip pattern.
+**2. Over-jump.** SG moves in the trend direction, but much faster than the typical step (>2× expected, with a minimum jump of 5 raw units on SG2 / 15 on SG4). Sudden over-acceleration of the load signal — typical SG4 slip pattern. *Coarse phase only.*
 
 **3. CV spike — high variance.** Run-to-run CV jumps to ≥ 10 % AND ≥ 1.5× the recent average. Catches sudden chaotic slip.
 
-**4. CV jump — low baseline.** CV reaches ≥ 5 % (coarse) or ≥ 4 % (bisection) AND ≥ 2.5× (coarse) or 2.0× (bisection) the recent average. Catches the characteristic CV jump on stable SG2 setups (TMC5160) where overall variance is low but a sudden spike still indicates slip. **Often fires one full step before the snap-back/over-jump triggers do.**
+**4. CV jump — immediate baseline.** CV reaches ≥ 5 % (coarse) or ≥ 4 % (bisection) AND ≥ 2.5× (coarse) or 2.0× (bisection) the avg of the previous 3 steps. Catches the characteristic CV jump on stable SG2 setups (TMC5160) where overall variance is low but a sudden spike still indicates slip. **Often fires one full step before the snap-back/over-jump triggers do.**
 
 **5. CV rising trend.** CV grows ≥ 1.3× across each of two consecutive steps AND reaches ≥ 5 % (coarse) or ≥ 4 % (bisection). Catches gradual slip onset where each individual step is borderline but the trend is unmistakable.
 
-**6. IQR/spread anomaly.** The IQR (P75 − P25) widens to ≥ 12 raw units AND ≥ 3× (coarse) or 1.7× (bisection) the recent baseline. Catches "quiet" stalls that occur briefly at the start or end of a move and are absorbed by the median over 5 repetitions, but show up as a wider sample distribution.
+**6. CV vs coarse-phase baseline (bisection only).** Current CV ≥ 5 % AND ≥ 2.0× the median CV from the COARSE phase. Catches cases where one elevated bisect step has already pulled the immediate baseline up, masking subsequent elevated values. The coarse phase is the slip-free reference.
+
+**7. IQR/spread anomaly — immediate baseline.** The IQR (P75 − P25) widens to ≥ 12 raw units AND ≥ 3× (coarse) or 1.7× (bisection) the recent baseline. Catches "quiet" stalls that occur briefly at the start or end of a move and are absorbed by the median over 5 repetitions, but show up as a wider sample distribution.
+
+**8. IQR vs coarse-phase baseline (bisection only).** IQR ≥ 18 raw units AND ≥ 2.5× the median IQR from the COARSE phase. Same idea as trigger 6 but for spread instead of variance.
+
+**9. IQR absolute (bisection only).** IQR ≥ 25 raw units. A motor near slip should have median, P25 and P75 within a few units of each other; an IQR of 25+ is unmistakable slip regardless of context.
 
 ### CoolStep-specific triggers (only when CoolStep regulates `CS_ACTUAL`)
 
 These fire only when CoolStep is genuinely adjusting current (`CS_ACTUAL` varies across steps). If `CS_ACTUAL` stays static at 31 the whole run — common on TMC5160 with low SEMIN — the plugin auto-detects that and falls back to the always-on triggers above.
 
-**7. CS pegged at max + SG drop.** `CS_ACTUAL` reaches maximum (≥ 30) while SG drops ≥ 30 % vs the previous step, and CS was actually regulating in the recent history (some prior step had CS < 25). The canonical slip signature with active CoolStep — load suddenly maxes out the current regulator.
+**10. CS pegged at max + SG drop.** `CS_ACTUAL` reaches maximum (≥ 30) while SG drops ≥ 30 % vs the previous step, and CS was actually regulating in the recent history (some prior step had CS < 25). The canonical slip signature with active CoolStep — load suddenly maxes out the current regulator. *Coarse phase only.*
 
-**8. CS pegged at max + CV spike.** `CS_ACTUAL` reaches maximum while CV ≥ 5 % AND a CV spike pattern fires — intermittent slip with simultaneous current saturation.
+**11. CS pegged at max + CV spike.** `CS_ACTUAL` reaches maximum while CV ≥ 5 % AND a CV spike pattern fires — intermittent slip with simultaneous current saturation. *Coarse phase only.*
 
-**9. CS hard drop.** `CS_ACTUAL` drops by more than 8 in one step from a regulating state. Indicates the motor lost contact with the load entirely (decoupling stall — gear jumped a tooth, filament ground out, etc).
+**12. CS hard drop.** `CS_ACTUAL` drops by more than 8 in one step from a regulating state. Indicates the motor lost contact with the load entirely (decoupling stall — gear jumped a tooth, filament ground out, etc). *Coarse phase only.*
 
 ### Bisection-aware sensitivity
 
 CV and IQR thresholds tighten in the bisection / verify phases — once we're already near the slip point, smaller anomalies are meaningful evidence. This keeps the coarse phase noise-resistant while making the final estimate accurate to ±1 mm³/s.
 
+### Borderline re-test (new)
+
+When a bisection step doesn't trigger any of the above but lands in a "gray zone" — CV between 4 % and 7 %, OR IQR between 15 and 24 raw units, AND elevated vs the coarse-phase baseline — the plugin **re-measures the same flow once** (with cool-down) before classifying it.
+
+| Metric | Clear safe | **Gray zone** | Clear trigger |
+|---|---|---|---|
+| CV | < 4 % | **4 – 7 % AND ≥ 1.5× coarse-median** | ≥ 7 % (caught by trigger 3 / 6) |
+| IQR | < 15 | **15 – 24 AND ≥ 1.7× coarse-median** | ≥ 25 (caught by trigger 9) |
+
+Decision after the re-test:
+- Re-test fires a real trigger → **trigger** (high = mid)
+- Re-test is clearly safe (CV/IQR drop into safe range) → **safe** (low = mid)
+- Re-test is borderline again → **trigger** (two consecutive borderline measurements at the same flow can't be coincidence)
+
+Each flow is re-tested at most once per bisection run. Adds ~30–60 s in the typical case, ~5 min in the worst case (every bisection step borderline). Console messages flag re-tests so you can see when this happens.
+
 ### Other behaviour
 
+- **Direction-independent triggers in bisection.** The bisection probes flows in arbitrary order (e.g. 120 → 115 → 118 → 116). Triggers 3–9 evaluate each step on its own merits, ignoring whether the previous probe was higher or lower.
 - **Warmup exclusion**: the first run of each measurement is excluded if it deviates more than 10 % from the rest (filament pressure buildup).
 - **First-trigger-wins**: the plugin saves a first-trigger snapshot, then continues with bisection/verify and updates the result if a tighter bound is found.
 
@@ -542,7 +565,7 @@ The HTML report renders in any browser and includes:
 - **SG vs. flow chart** with median + IQR (P25/P75) and average
 - **CS_ACTUAL vs. flow chart** (CoolStep mode only)
 - **Phase markers** — vertical dashed lines at Coarse → Bisection → Verify transitions
-- **Data table** with inter-run consistency (CV) for each measurement
+- **Data table** with inter-run consistency (CV) for each measurement. Re-tested borderline flows appear once (the re-test result replaces the first measurement) so the table stays one-row-per-flow.
 - **Stop reason** (which trigger fired and at which flow), shown below the result panel
 - **TMC driver settings** captured at the start of the run — collapsible block listing all StallGuard / CoolStep-relevant fields (`SGT`, `SFILT`, `sg4_thrs`, `SEMIN`, `SEMAX`, `TCOOLTHRS`, chopper-mode flags, etc.) so you have a reproducible paper trail of the configuration that produced the result. Same block is appended as a comment header to the CSV file.
 
