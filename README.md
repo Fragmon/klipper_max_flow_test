@@ -82,6 +82,69 @@ Test takes ~10–13 minutes total: ~1–2 min for Auto-SGT calibration plus ~10 
 
 ---
 
+## Choosing the test range (START / MAX)
+
+The two most important parameters for `TMC_FLOW_FIND_MAX` are `START` and `MAX` — they define the flow range the plugin sweeps. Picking these values right matters: too narrow and you'll miss the slip point; too wide and you waste time on irrelevant low-flow steps.
+
+### Default values
+
+```
+TMC_FLOW_FIND_MAX                 # uses START=10, MAX=80
+```
+
+The defaults are tuned for **typical V6-class hotends** which run cleanly up to 10–15 mm³/s but rarely past 25–30 mm³/s. With `START=10` and `MAX=80`, the plugin sweeps from a safe baseline up to roughly 3× the maximum flow most stock hotends can sustain — which catches slip on practically any stock setup.
+
+For high-flow hotends (Volcano, CHT, Rapido HF, Revo Voron, Mosquito Magnum) the defaults will likely terminate at MAX without finding slip. **Bump MAX upward** — see the table below.
+
+### How to pick START and MAX
+
+A good rule of thumb: **set MAX to ~1.5× your hotend's nominal max-flow rating, and START to ~30 % of that nominal value.** That gives the plugin enough headroom above the rated limit to find real slip, and a reasonable starting point that's already in the SG-informative region.
+
+| Your hotend's nominal max-flow | Suggested `START` | Suggested `MAX` | Example command |
+|---|---|---|---|
+| **~15 mm³/s** (V6 stock, Revo Six 0.4) | `5` | `25` | `TMC_FLOW_FIND_MAX START=5 MAX=25` |
+| **~25 mm³/s** (Volcano, CHT 0.4 on V6) | `10` | `40` | `TMC_FLOW_FIND_MAX START=10 MAX=40` |
+| **~30 mm³/s** (Dragon HF, Rapido HF 0.4) | `10` | `50` | `TMC_FLOW_FIND_MAX START=10 MAX=50` |
+| **~50 mm³/s** (Rapido HF 0.6, Mosquito Magnum) | `20` | `80` | `TMC_FLOW_FIND_MAX START=20 MAX=80` |
+| **~80 mm³/s** (Goliath, Bondtech CHT 0.8) | `30` | `120` | `TMC_FLOW_FIND_MAX START=30 MAX=120` |
+| **Unknown / want full discovery** | `10` | `150` | `TMC_FLOW_FIND_MAX START=10 MAX=150` |
+
+> **Don't know your hotend's nominal max-flow?** Check the manufacturer's spec sheet, or look up flow-test results others have published for your model. As a fallback: start with `MAX=80` (the default) — if the plugin ends without finding slip, double MAX and re-run.
+
+### What START actually does
+
+`START` is the first flow rate the coarse sweep tests. It does NOT affect the slip-detection algorithm — only where the test begins. The plugin always steps up by `COARSE_STEP` (default 10 mm³/s) until it sees slip indicators.
+
+**Why not just always start at 1 mm³/s?** Two reasons:
+- StallGuard signal at very low flow rates can be noisy (especially on TMC2209 where there's a "low-velocity bias region" below ~30 mm³/s)
+- Each step takes ~25 seconds (5 reps × 5 s). Starting too low wastes minutes on flows that obviously won't slip.
+
+A good START is **above the SG noise floor** but **well below your expected slip point**. The defaults handle this for typical setups; the table above adjusts for your specific hotend.
+
+### What MAX actually does
+
+`MAX` is the upper safety cap. The plugin stops the coarse sweep at MAX even if no slip was detected. If you reach MAX without trigger, you'll see:
+
+```
+>>> Reached MAX (80.0 mm³/s) without trigger.
+```
+
+This means either:
+1. Your hotend can genuinely flow more than MAX (rare on stock setups, common with CHT/Volcano/Rapido)
+2. Your StallGuard sensitivity is too low to detect slip
+3. Your `run_current` is so high the motor never actually slips at the tested flow rates
+
+If you hit MAX without trigger, **double MAX** and re-run. If you hit MAX a second time, check `TMC_FLOW_STATUS` for sensitivity issues.
+
+### Common pitfalls
+
+- **Setting START too high** — plugin starts at e.g. 50 mm³/s on a hotend that slips at 40. Result: trigger fires immediately at the first step and bisection narrows downward. Better: start lower so coarse-baseline statistics are well-established before slip.
+- **Setting MAX equal to expected flow** — leaves no headroom for the coarse sweep to overshoot. Always set MAX at least 30–50 % above your expected slip point.
+- **Setting MAX = 999** — wastes time on flows your hardware can't physically sustain. Pick a realistic upper bound based on the hotend.
+- **Using the default for a known high-flow setup** — stock 80 mm³/s default is too low for CHT-equipped Volcano hotends. Bump to 120–150.
+
+---
+
 ## Auto-SGT calibration
 
 The biggest factor in StallGuard accuracy is the `driver_SGT` setting. Set it too high and SG saturates at 1023 (no useful range). Set it too low and SG hits the noise floor before the motor actually slips.
