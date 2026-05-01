@@ -146,9 +146,7 @@ The two most important parameters for `TMC_FLOW_FIND_MAX` are `START` and `MAX` 
 TMC_FLOW_FIND_MAX                 # uses START=10, MAX=80
 ```
 
-The defaults are tuned for **typical V6-class hotends** which run cleanly up to 10–15 mm³/s but rarely past 25–30 mm³/s. With `START=10` and `MAX=80`, the plugin sweeps from a safe baseline up to roughly 3× the maximum flow most stock hotends can sustain — which catches slip on practically any stock setup.
-
-For high-flow hotends (Volcano, CHT, Rapido HF, Revo Voron, Mosquito Magnum) the defaults will likely terminate at MAX without finding slip. **Bump MAX upward** — see the table below.
+The defaults are tuned for **high Flow hotends** which run cleanly up to 30-50 mm³/s. With `START=10` and `MAX=80`, the plugin sweeps from a safe baseline up to roughly 3× the maximum flow most stock hotends can sustain — which catches slip on practically any stock setup.
 
 ### How to pick START and MAX
 
