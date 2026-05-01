@@ -100,16 +100,20 @@ For high-flow hotends (Volcano, CHT, Rapido HF, Revo Voron, Mosquito Magnum) the
 
 A good rule of thumb: **set MAX to ~1.5× your hotend's nominal max-flow rating, and START to ~30 % of that nominal value.** That gives the plugin enough headroom above the rated limit to find real slip, and a reasonable starting point that's already in the SG-informative region.
 
-| Your hotend's nominal max-flow | Suggested `START` | Suggested `MAX` | Example command |
-|---|---|---|---|
-| **~15 mm³/s** (V6 stock, Revo Six 0.4) | `5` | `25` | `TMC_FLOW_FIND_MAX START=5 MAX=25` |
-| **~25 mm³/s** (Volcano, CHT 0.4 on V6) | `10` | `40` | `TMC_FLOW_FIND_MAX START=10 MAX=40` |
-| **~30 mm³/s** (Dragon HF, Rapido HF 0.4) | `10` | `50` | `TMC_FLOW_FIND_MAX START=10 MAX=50` |
-| **~50 mm³/s** (Rapido HF 0.6, Mosquito Magnum) | `20` | `80` | `TMC_FLOW_FIND_MAX START=20 MAX=80` |
-| **~80 mm³/s** (Goliath, Bondtech CHT 0.8) | `30` | `120` | `TMC_FLOW_FIND_MAX START=30 MAX=120` |
-| **Unknown / want full discovery** | `10` | `150` | `TMC_FLOW_FIND_MAX START=10 MAX=150` |
+> **One important caveat — coarse step size:** the plugin's slip-detection algorithms need **at least 4 coarse measurements before slip** to build a reliable statistical baseline. With the default `COARSE_STEP=10` mm³/s, low-flow setups (like a 15 mm³/s V6) would only get 2-3 measurements — not enough. For these cases, lower `COARSE_STEP` to 5 mm³/s.
+
+| Your hotend's nominal max-flow | `START` | `MAX` | `COARSE_STEP` | Example command |
+|---|---|---|---|---|
+| **~15 mm³/s** (V6 stock, Revo Six 0.4) | `5` | `25` | `5` | `TMC_FLOW_FIND_MAX START=5 MAX=25 COARSE_STEP=5` |
+| **~25 mm³/s** (Volcano, CHT 0.4 on V6) | `10` | `40` | `5` | `TMC_FLOW_FIND_MAX START=10 MAX=40 COARSE_STEP=5` |
+| **~30 mm³/s** (Dragon HF, Rapido HF 0.4) | `10` | `50` | `10` | `TMC_FLOW_FIND_MAX START=10 MAX=50` |
+| **~50 mm³/s** (Rapido HF 0.6, Mosquito Magnum) | `20` | `80` | `10` | `TMC_FLOW_FIND_MAX START=20 MAX=80` |
+| **~80 mm³/s** (Goliath, Bondtech CHT 0.8) | `30` | `120` | `10` | `TMC_FLOW_FIND_MAX START=30 MAX=120` |
+| **Unknown / want full discovery** | `10` | `150` | `10` | `TMC_FLOW_FIND_MAX START=10 MAX=150` |
 
 > **Don't know your hotend's nominal max-flow?** Check the manufacturer's spec sheet, or look up flow-test results others have published for your model. As a fallback: start with `MAX=80` (the default) — if the plugin ends without finding slip, double MAX and re-run.
+
+> **Sanity check:** with the values you choose, you should get **at least 5 coarse measurements** before slip. If your range gives fewer (e.g. START=10, MAX=30, STEP=10 → only 3 steps), lower `COARSE_STEP` to 5.
 
 ### What START actually does
 
@@ -142,6 +146,7 @@ If you hit MAX without trigger, **double MAX** and re-run. If you hit MAX a seco
 - **Setting MAX equal to expected flow** — leaves no headroom for the coarse sweep to overshoot. Always set MAX at least 30–50 % above your expected slip point.
 - **Setting MAX = 999** — wastes time on flows your hardware can't physically sustain. Pick a realistic upper bound based on the hotend.
 - **Using the default for a known high-flow setup** — stock 80 mm³/s default is too low for CHT-equipped Volcano hotends. Bump to 120–150.
+- **Range too narrow with default COARSE_STEP=10** — for low-flow hotends (V6, Revo Six, Volcano), the default step size produces too few coarse measurements for reliable baseline statistics. Drop `COARSE_STEP=5` so the plugin gets at least 5 measurements before slip.
 
 ---
 
