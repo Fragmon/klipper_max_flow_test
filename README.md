@@ -9,6 +9,12 @@ Find your extruder's real max flow rate automatically — no test prints, no mea
 Plugin by **Steven (Fragmon) — Crydteam**
 [![YouTube](https://img.shields.io/badge/YouTube-@crydteamprinting-red?logo=youtube)](https://www.youtube.com/@crydteamprinting)
 
+> ### ⚠️ Current scope: motor-slip detection only
+>
+> This plugin currently detects **only motor stall / extruder slip** — the point where the extruder gear loses grip on the filament. **Cold-extrusion detection** (curling/sputtering at the nozzle when the hotend can't melt fast enough) is **not yet implemented**. On non-high-flow hotends, cold extrusion often hits *before* motor slip, so the plugin's reported max-flow can exceed what your hotend can actually melt cleanly.
+>
+> Watch the strand visually during the test. If you see curling at a flow below the plugin's result, that's your real-world limit. Automatic cold-extrusion detection is on the roadmap.
+
 <p align="center">
   <img src="images/results.png" alt="TMC Flow Test HTML report" width="700">
 </p>
