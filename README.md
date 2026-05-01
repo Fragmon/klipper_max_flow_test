@@ -9,6 +9,24 @@ Find your extruder's real max flow rate automatically — no test prints, no mea
 Plugin by **Steven (Fragmon) — Crydteam**
 [![YouTube](https://img.shields.io/badge/YouTube-@crydteamprinting-red?logo=youtube)](https://www.youtube.com/@crydteamprinting)
 
+---
+
+> ### ⚠️ Important — what this plugin currently detects
+>
+> **✅ Reliably detected:** motor **stall / extruder slip** (the extruder gear loses grip on the filament). This is the plugin's main purpose and is well-validated on TMC5160 and TMC2240.
+>
+> **❌ NOT yet automatically detected:** **cold extrusion** (filament curls or sputters at the nozzle because the hotend can't melt fast enough). This is a separate physical limit — and on most non-high-flow hotends it actually hits **before** motor slip.
+>
+> **What this means for you:** if your hotend cold-extrudes before the motor slips, the plugin's reported max-flow value will be **higher than what you can actually print cleanly**. The plugin doesn't currently see this from the SG signal alone.
+>
+> **Workaround for now:** watch the test visually. Note where the extruded strand starts to curl, sputter, or look rough. You can then either:
+> - Pass that flow as `COLD_EXTRUSION_HINT=<value>` to mark it as a reference line in the HTML report, or
+> - Just take the lower of the two limits (your visual cold-extrusion observation vs. the plugin's slip result) when you set your slicer's max volumetric speed
+>
+> Automatic cold-extrusion detection is on the roadmap. We need community test data with manually-marked onset points before we can calibrate it reliably — see the [Marking cold-extrusion onset](#marking-cold-extrusion-onset-optional) section if you'd like to contribute data.
+
+---
+
 <p align="center">
   <img src="images/results.png" alt="TMC Flow Test HTML report" width="700">
 </p>
@@ -25,6 +43,16 @@ The plugin reads the TMC driver's **StallGuard** load signal during extrusion to
 4. **Verification** — final value is confirmed with extra repeats and a stability metric; if verify fails, the test drops back into bisection with a tighter bracket
 
 Output: a CSV with raw data and an interactive HTML report with a **decision trail** (every trigger that fired, why, and which value defined the result).
+
+> **⚠️ What this plugin does and doesn't measure**
+>
+> Currently the plugin **only reliably detects motor slip / stall** — the point where the extruder gear loses grip on the filament. This is the **mechanical-side** limit.
+>
+> The plugin does **NOT yet detect cold extrusion** (the *thermal-side* limit, where the hotend can't melt fast enough — visible as filament curling, sputtering, or rough strands at the nozzle). On many setups, especially V6-class hotends, the cold-extrusion limit is **lower** than the motor-slip limit, so the plugin's reported max-flow can exceed what your hotend can actually melt cleanly.
+>
+> **For now**: watch the strand visually during the test. If you see curling/sputtering at a flow rate **below** the plugin's result, that's your real-world limit. You can mark it manually with `COLD_EXTRUSION_HINT=N` (see [Marking cold-extrusion onset](#marking-cold-extrusion-onset-optional)) — it'll show up as a blue reference line in the HTML report.
+>
+> **Future work**: automatic cold-extrusion detection from the SG signal pattern is on the roadmap, but needs more empirical data to calibrate. Marking the cold-extrusion onset in your test runs helps build that dataset.
 
 ---
 
@@ -195,6 +223,40 @@ If you hit MAX without trigger, **double MAX** and re-run. If you hit MAX a seco
 - **Setting MAX = 999** — wastes time on flows your hardware can't physically sustain. Pick a realistic upper bound based on the hotend.
 - **Using the default for a known high-flow setup** — stock 80 mm³/s default is too low for CHT-equipped Volcano hotends. Bump to 120–150.
 - **Range too narrow with default COARSE_STEP=10** — for low-flow hotends (V6, Revo Six, Volcano), the default step size produces too few coarse measurements for reliable baseline statistics. Drop `COARSE_STEP=5` so the plugin gets at least 5 measurements before slip.
+
+---
+
+## Marking cold-extrusion onset (optional)
+
+The plugin measures the maximum flow your **motor** can sustain — at the upper limit, the extruder gear slips on the filament. But there's a separate, often lower limit: the maximum flow your **hotend** can melt cleanly. Above the hotend's melting capacity, you start seeing **cold extrusion** symptoms:
+
+- Filament no longer comes out as smooth strands but starts to **curl, twist, or sputter** at the nozzle
+- The strand may have a rough, "extruded sausage" texture instead of a clean cylindrical shape
+- Visually obvious during the test — molten material is mixed with partially-unmelted core
+
+Cold extrusion happens before motor slip on most non-high-flow hotends. The plugin won't detect it automatically (it doesn't see the strand, only the motor signal), but you can mark it manually so the HTML report shows it alongside the slip result.
+
+### How to use
+
+1. Watch the test as it runs. Note the flow rate where the strand starts to curl or look rough.
+2. Re-run the test with that value as `COLD_EXTRUSION_HINT`:
+
+```
+TMC_FLOW_FIND_MAX MAX=150 START=10 COLD_EXTRUSION_HINT=60
+```
+
+3. The HTML report will show a **blue vertical line** at 60 mm³/s labeled "Cold-extrusion onset", alongside the trigger annotations from the slip-detection algorithms.
+
+### Why this matters
+
+For your **slicer's max-volumetric-speed setting**, the *lower* of the two limits is what counts:
+
+- If your hotend cold-extrudes at 60 mm³/s and your motor slips at 110 mm³/s, your real-world max-flow is ~60 mm³/s (with safety margin: 50 mm³/s)
+- If your hotend can do 100 mm³/s cleanly but your motor slips at 80 mm³/s, your real-world max is ~80 mm³/s (with safety margin: 65 mm³/s)
+
+Marking the cold-extrusion point keeps both numbers visible in the same chart so you can pick the right slicer value.
+
+> **Note**: This is a pure annotation — it doesn't affect the test in any way. The plugin's slip detection runs identically with or without the hint.
 
 ---
 
@@ -438,6 +500,7 @@ Run the StallGuard-based flow test (Auto-SGT → Coarse → Bisection → Verifi
 | `MAX_BISECT_STEPS` | 6 | Max bisection iterations |
 | `AUTO_SGT` | 1 | `1` = run Auto-SGT calibration before test (SG2 drivers only). `0` = skip |
 | `KEEP_SGT` | 0 | `1` = leave the tuned SGT active until next FIRMWARE_RESTART. `0` = restore original after test |
+| `COLD_EXTRUSION_HINT` | 0 | mm³/s value above which YOU have observed cold-extrusion symptoms (curling at the nozzle, rough strands) on this hotend. Drawn as a vertical reference line in the HTML report. Set to 0 to disable. Doesn't affect slip detection. |
 | `NO_HTML` | 0 | Set 1 to skip HTML report |
 | `SKIP_TMC_CHECK` | 0 | Set 1 to bypass config validation |
 
@@ -474,6 +537,9 @@ TMC_FLOW_FIND_MAX MAX=150 START=10 KEEP_SGT=1
 
 # Skip Auto-SGT and use your configured SGT directly
 TMC_FLOW_FIND_MAX MAX=150 START=10 AUTO_SGT=0
+
+# Mark cold-extrusion onset at 60 mm³/s in the HTML report
+TMC_FLOW_FIND_MAX MAX=150 START=10 COLD_EXTRUSION_HINT=60
 
 # Quicker, less accurate
 TMC_FLOW_FIND_MAX REPEAT=3 VERIFY_REPEATS=3 COOLDOWN=10
