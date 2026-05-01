@@ -74,7 +74,7 @@ Both implement **StallGuard2 (SG2)** which works in **SpreadCycle** chopper mode
 1. **Install** (one-liner):
    ```bash
    cd ~/klipper/klippy/extras && \
-   wget -O tmc_flow_test.py https://raw.githubusercontent.com/Fragmon/klipper_max_flow_test/main/tmc_flow_test py 
+   wget -O tmc_flow_test.py https://raw.githubusercontent.com/Fragmon/klipper_max_flow_test/main/tmc_flow_test.py 
    ```
 2. **Configure** your `[tmcXXXX extruder]` and add a `[tmc_flow_test]` section (see [Configuration](#configuration) below).
 3. `FIRMWARE_RESTART`.
