@@ -73,12 +73,60 @@ Both implement **StallGuard2 (SG2)** which works in **SpreadCycle** chopper mode
 2. **Configure** your `[tmcXXXX extruder]` and add a `[tmc_flow_test]` section (see [Configuration](#configuration) below).
 3. `FIRMWARE_RESTART`.
 4. **Heat your hotend** to printing temperature, load filament.
-5. Run:
+5. **Move the toolhead clear of the bed** — see [Physical setup before running](#physical-setup-before-running) below. The test extrudes a lot of filament and needs space.
+6. Run:
    ```
    TMC_FLOW_FIND_MAX MAX=150 START=10
    ```
 
 Test takes ~10–13 minutes total: ~1–2 min for Auto-SGT calibration plus ~10 min for the actual sweep. Add 30–60 s if borderline measurements need re-testing. CSV and HTML report land in `~/printer_data/config/Flowtest/`.
+
+---
+
+## Physical setup before running
+
+The test extrudes **a lot** of filament — at high flow rates the motor pushes around 30 mm/sec linear feed for 5 seconds at a time, and there are dozens of repetitions across coarse, bisection, and verification phases. Total extruded filament can easily be **2–5 meters** over the full test run.
+
+That extruded plastic has to go somewhere. **Without preparation it piles up on the nozzle, on the bed, or wraps around the toolhead** — at minimum messy, at worst tangled around the heatblock or jammed against the print bed.
+
+### Required: clear the area
+
+**Before running the test, move the toolhead so molten extrusion has room to fall away cleanly.** Two good options:
+
+**Option A — Above the bed (most printers):**
+Move the toolhead to a Z-height of **at least 50–80 mm above the bed**, ideally near the centre of the print area so falling filament doesn't catch on bed clips or wires.
+
+```
+G28
+G1 Z80 F600                  ; lift to 80 mm
+G1 X100 Y100 F3000           ; centre over bed (adjust for your printer size)
+M109 S230                    ; heat hotend (adjust temp for your filament)
+```
+
+**Option B — Off the bed entirely (recommended if printer geometry allows):**
+Some printers can park the toolhead off the bed — over a purge bucket, drop chute, or just past the bed edge. This is ideal because extruded filament drops straight down without contacting anything important.
+
+```
+G28
+G1 X<purge_x> Y<purge_y> Z50 F3000   ; move to purge area
+M109 S230
+```
+
+### Quick checklist before you press go
+
+- [ ] Hotend at printing temperature (check actual, not just target)
+- [ ] Filament loaded and the path from spool to extruder is clear
+- [ ] Spool turns freely — no tangles, snags, or "first wrap caught under the layer below"
+- [ ] At least 1–2 meters of filament available on the spool (more for full discovery runs)
+- [ ] Toolhead position: high above bed, or parked over an open area
+- [ ] Nothing fragile near the nozzle (cables, fans, BL-Touch probes)
+- [ ] If you can: lay a small piece of paper or cardboard on the bed below the nozzle to catch the dropped filament — easier cleanup
+
+### What to expect during the test
+
+You'll see filament extrude in chunks every few seconds. At low flow it'll come out as thin ropes; at high flow it'll come out fast and may curl or sputter. Some "spaghetti" buildup near the nozzle is normal — the plugin doesn't pause to clean between phases.
+
+If you hear **clacking or grinding from the extruder** at high flow rates, that's the motor physically slipping. This is **expected and intentional** at the upper end of the test (it's how the plugin finds your real limit). Only stop the test (`M112`) if you hear something else — like the spool jamming, a thermistor disconnect, or the nozzle scraping the bed.
 
 ---
 
