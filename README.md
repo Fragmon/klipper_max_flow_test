@@ -142,7 +142,7 @@ M109 S230
 
 You'll see filament extrude in chunks every few seconds. At low flow it'll come out as thin ropes; at high flow it'll come out fast and may curl or sputter. Some "spaghetti" buildup near the nozzle is normal — the plugin doesn't pause to clean between phases.
 
-If you hear **clacking or grinding from the extruder** at high flow rates, that's the motor physically slipping. This is **expected and intentional** at the upper end of the test (it's how the plugin finds your real limit). Only stop the test (`M112`) if you hear something else — like the spool jamming, a thermistor disconnect, or the nozzle scraping the bed.
+If you hear **clacking or grinding from the extruder** at high flow rates, that's the motor physically slipping. This is **expected and intentional** at the upper end of the test (it's how the plugin finds your real limit). Only stop the test (`M112`) if you hear something else. 
 
 ---
 
