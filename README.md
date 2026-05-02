@@ -5,15 +5,16 @@ Find your extruder's real max flow rate automatically — no test prints, no mea
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Klipper](https://img.shields.io/badge/Klipper-compatible-green.svg)](https://www.klipper3d.org/)
+[![Kalico](https://img.shields.io/badge/Kalico-compatible-brightgreen.svg)](https://github.com/KalicoCrew/kalico)
 
 Plugin by **Steven (Fragmon) — Crydteam**
 [![YouTube](https://img.shields.io/badge/YouTube-@crydteamprinting-red?logo=youtube)](https://www.youtube.com/@crydteamprinting)
 
-> ### ⚠️ Current scope: motor-slip detection only
+> ### ℹ️ What this plugin detects
 >
-> This plugin currently detects **only motor stall / extruder slip** — the point where the extruder gear loses grip on the filament. **Cold-extrusion detection** (curling/sputtering at the nozzle when the hotend can't melt fast enough) is **not yet implemented**. On non-high-flow hotends, cold extrusion often hits *before* motor slip, so the plugin's reported max-flow can exceed what your hotend can actually melt cleanly.
+> The primary detection target is **motor stall / extruder slip** — the point where the extruder gear loses grip on the filament. Detection is reliable across SG2 drivers (TMC5160 / TMC2240) and uses multiple independent triggers (SG patterns, run-to-run variance, IQR widening, single-step and cumulative plateaus).
 >
-> Watch the strand visually during the test. If you see curling at a flow below the plugin's result, that's your real-world limit. Automatic cold-extrusion detection is on the roadmap.
+> **Cold-extrusion hints** (heater can't melt fast enough) are **available as a heuristic visualization** — the plugin computes a 0–100 thermal stress score per step combining heater PWM, temperature drop, intra-run SG drift, and other signals. This colours the chart green/yellow/red but does NOT trigger or change the slip-detection result. Always cross-check the strand visually for clean extrusion.
 
 <p align="center">
   <img src="images/results.png" alt="TMC Flow Test HTML report" width="700">
@@ -30,7 +31,9 @@ The plugin reads the TMC driver's **StallGuard** load signal during extrusion to
 3. **Bisection** — the safe value is narrowed to ±1 mm³/s; borderline measurements are auto-re-tested
 4. **Verification** — final value is confirmed with extra repeats and a stability metric; if verify fails, the test drops back into bisection with a tighter bracket
 
-Output: a CSV with raw data and an interactive HTML report with a **decision trail** (every trigger that fired, why, and which value defined the result).
+While running, the plugin also captures **thermal telemetry** (heater PWM, temperature, driver thermal flags) to give context for the result and flag possible cold-extrusion situations.
+
+Output: a CSV with raw data and an interactive HTML dashboard report with hero panel, insight cards, tabbed charts, decision timeline, and full collapsible details.
 
 ---
 
@@ -38,8 +41,8 @@ Output: a CSV with raw data and an interactive HTML report with a **decision tra
 
 | Driver | Status | Mode | Detection |
 |---|---|---|---|
-| **TMC5160** (incl. TMC2130) | ✅ Production | SpreadCycle / SG2 | Full SG-magnitude + variance |
-| **TMC2240** | ✅ Production | SpreadCycle / SG2 | Full SG-magnitude + variance |
+| **TMC5160** (incl. TMC2130) | ✅ Production | SpreadCycle / SG2 | Full SG-magnitude + variance + plateau + IQR |
+| **TMC2240** | ✅ Production | SpreadCycle / SG2 | Full SG-magnitude + variance + plateau + IQR |
 | **TMC2209** | ⚠️ Experimental | SpreadCycle / SG4 | CV-spike (variance) only |
 
 ### Production drivers (TMC5160 / TMC2240)
@@ -74,18 +77,25 @@ Both implement **StallGuard2 (SG2)** which works in **SpreadCycle** chopper mode
 1. **Install** (one-liner):
    ```bash
    cd ~/klipper/klippy/extras && \
-   wget -O tmc_flow_test.py https://raw.githubusercontent.com/Fragmon/klipper_max_flow_test/main/tmc_flow_test.py 
+   wget -O tmc_flow_test.py https://raw.githubusercontent.com/Fragmon/klipper_max_flow_test/main/tmc_flow_test.py
    ```
+   *(Kalico users: same path — Kalico ships its `extras/` at the same location.)*
 2. **Configure** your `[tmcXXXX extruder]` and add a `[tmc_flow_test]` section (see [Configuration](#configuration) below).
-3. `FIRMWARE_RESTART`.
+3. **Restart** the Klipper service:
+   ```bash
+   sudo systemctl restart klipper
+   ```
+   *(`FIRMWARE_RESTART` is **not** enough — the Python plugin only reloads on service restart.)*
 4. **Heat your hotend** to printing temperature, load filament.
 5. **Move the toolhead clear of the bed** — see [Physical setup before running](#physical-setup-before-running) below. The test extrudes a lot of filament and needs space.
 6. Run:
    ```
-   TMC_FLOW_FIND_MAX MAX=150 START=10
+   TMC_FLOW_FIND_MAX MAX=120 START=25 COARSE_STEP=5
    ```
 
 Test takes ~10–13 minutes total: ~1–2 min for Auto-SGT calibration plus ~10 min for the actual sweep. Add 30–60 s if borderline measurements need re-testing. CSV and HTML report land in `~/printer_data/config/Flowtest/`.
+
+> **Why `COARSE_STEP=5`?** The new IQR-cumulative-growth trigger needs at least 5 coarse steps of history to fire reliably. With `COARSE_STEP=5` you get ~20 steps for the typical range, giving every detection algorithm enough data. The legacy default `COARSE_STEP=10` still works but is less sensitive on low-flow setups.
 
 ---
 
@@ -136,40 +146,40 @@ If you hear **clacking or grinding from the extruder** at high flow rates, that'
 
 ---
 
-## Choosing the test range (START / MAX)
+## Choosing the test range (START / MAX / COARSE_STEP)
 
-The two most important parameters for `TMC_FLOW_FIND_MAX` are `START` and `MAX` — they define the flow range the plugin sweeps. Picking these values right matters: too narrow and you'll miss the slip point; too wide and you waste time on irrelevant low-flow steps.
+The three most important parameters for `TMC_FLOW_FIND_MAX` define the flow range and resolution of the sweep. Picking these values right matters: too narrow and you'll miss the slip point; too wide or too coarse and detection algorithms don't have enough data.
 
 ### Default values
 
 ```
-TMC_FLOW_FIND_MAX                 # uses START=10, MAX=80
+TMC_FLOW_FIND_MAX                 # uses START=10, MAX=80, COARSE_STEP=10
 ```
 
-The defaults are tuned for **high Flow hotends** which run cleanly up to 30-50 mm³/s. With `START=10` and `MAX=80`, the plugin sweeps from a safe baseline up to roughly 3× the maximum flow most stock hotends can sustain — which catches slip on practically any stock setup.
+The defaults are tuned for **medium-flow hotends** running cleanly up to 30–50 mm³/s. With `START=10`, `MAX=80`, `COARSE_STEP=10`, the plugin sweeps from a safe baseline up to roughly 3× the maximum flow most stock hotends can sustain, in 8 coarse steps.
 
-### How to pick START and MAX
+### How to pick START, MAX, and COARSE_STEP
 
-A good rule of thumb: **set MAX to ~1.5× your hotend's nominal max-flow rating, and START to ~30 % of that nominal value.** That gives the plugin enough headroom above the rated limit to find real slip, and a reasonable starting point that's already in the SG-informative region.
+A good rule of thumb: **set MAX to ~1.5× your hotend's nominal max-flow rating, START to ~30 % of that nominal value, and use `COARSE_STEP=5` for low-flow hotends or any setup where you want maximum detection sensitivity.**
 
-> **One important caveat — coarse step size:** the plugin's slip-detection algorithms need **at least 4 coarse measurements before slip** to build a reliable statistical baseline. With the default `COARSE_STEP=10` mm³/s, low-flow setups (like a 15 mm³/s V6) would only get 2-3 measurements — not enough. For these cases, lower `COARSE_STEP` to 5 mm³/s.
+> **Why `COARSE_STEP=5` is now generally recommended:** v3.1 introduced two new triggers — *single-step plateau* and *IQR cumulative growth* — that need more historical data than the older single-step ratio triggers. With `COARSE_STEP=5` you get ~20 measurement points across the typical range, which gives all triggers (both old and new) enough samples to build reliable statistics.
 
 | Your hotend's nominal max-flow | `START` | `MAX` | `COARSE_STEP` | Example command |
 |---|---|---|---|---|
 | **~15 mm³/s** (V6 stock, Revo Six 0.4) | `5` | `25` | `5` | `TMC_FLOW_FIND_MAX START=5 MAX=25 COARSE_STEP=5` |
 | **~25 mm³/s** (Volcano, CHT 0.4 on V6) | `10` | `40` | `5` | `TMC_FLOW_FIND_MAX START=10 MAX=40 COARSE_STEP=5` |
-| **~30 mm³/s** (Dragon HF, Rapido HF 0.4) | `10` | `50` | `10` | `TMC_FLOW_FIND_MAX START=10 MAX=50` |
-| **~50 mm³/s** (Rapido HF 0.6, Mosquito Magnum) | `20` | `80` | `10` | `TMC_FLOW_FIND_MAX START=20 MAX=80` |
-| **~80 mm³/s** (Goliath, Bondtech CHT 0.8) | `30` | `120` | `10` | `TMC_FLOW_FIND_MAX START=30 MAX=120` |
-| **Unknown / want full discovery** | `10` | `150` | `10` | `TMC_FLOW_FIND_MAX START=10 MAX=150` |
+| **~30 mm³/s** (Dragon HF, Rapido HF 0.4) | `10` | `60` | `5` | `TMC_FLOW_FIND_MAX START=10 MAX=60 COARSE_STEP=5` |
+| **~50 mm³/s** (Rapido HF 0.6, Mosquito Magnum) | `15` | `80` | `5` | `TMC_FLOW_FIND_MAX START=15 MAX=80 COARSE_STEP=5` |
+| **~80 mm³/s** (Goliath, Bondtech CHT 0.8) | `25` | `120` | `5` | `TMC_FLOW_FIND_MAX START=25 MAX=120 COARSE_STEP=5` |
+| **Unknown / want full discovery** | `10` | `150` | `5` | `TMC_FLOW_FIND_MAX START=10 MAX=150 COARSE_STEP=5` |
 
-> **Don't know your hotend's nominal max-flow?** Check the manufacturer's spec sheet, or look up flow-test results others have published for your model. As a fallback: start with `MAX=80` (the default) — if the plugin ends without finding slip, double MAX and re-run.
+> **Don't know your hotend's nominal max-flow?** Check the manufacturer's spec sheet, or look up flow-test results others have published for your model. As a fallback: start with `MAX=120` — if the plugin ends without finding slip, double MAX and re-run.
 
-> **Sanity check:** with the values you choose, you should get **at least 5 coarse measurements** before slip. If your range gives fewer (e.g. START=10, MAX=30, STEP=10 → only 3 steps), lower `COARSE_STEP` to 5.
+> **Sanity check:** with the values you choose, you should get **at least 8 coarse measurements** before slip. If your range gives fewer, lower `COARSE_STEP`.
 
 ### What START actually does
 
-`START` is the first flow rate the coarse sweep tests. It does NOT affect the slip-detection algorithm — only where the test begins. The plugin always steps up by `COARSE_STEP` (default 10 mm³/s) until it sees slip indicators.
+`START` is the first flow rate the coarse sweep tests. It does NOT affect the slip-detection algorithm — only where the test begins. The plugin always steps up by `COARSE_STEP` until it sees slip indicators.
 
 **Why not just always start at 1 mm³/s?** Two reasons:
 - StallGuard signal at very low flow rates can be noisy (especially on TMC2209 where there's a "low-velocity bias region" below ~30 mm³/s)
@@ -197,8 +207,7 @@ If you hit MAX without trigger, **double MAX** and re-run. If you hit MAX a seco
 - **Setting START too high** — plugin starts at e.g. 50 mm³/s on a hotend that slips at 40. Result: trigger fires immediately at the first step and bisection narrows downward. Better: start lower so coarse-baseline statistics are well-established before slip.
 - **Setting MAX equal to expected flow** — leaves no headroom for the coarse sweep to overshoot. Always set MAX at least 30–50 % above your expected slip point.
 - **Setting MAX = 999** — wastes time on flows your hardware can't physically sustain. Pick a realistic upper bound based on the hotend.
-- **Using the default for a known high-flow setup** — stock 80 mm³/s default is too low for CHT-equipped Volcano hotends. Bump to 120–150.
-- **Range too narrow with default COARSE_STEP=10** — for low-flow hotends (V6, Revo Six, Volcano), the default step size produces too few coarse measurements for reliable baseline statistics. Drop `COARSE_STEP=5` so the plugin gets at least 5 measurements before slip.
+- **COARSE_STEP too large** — with the default `COARSE_STEP=10` on a low-flow setup, you may only get 4–5 coarse measurements. The new IQR-cumulative-growth trigger needs ≥5 coarse steps to fire. Use `COARSE_STEP=5` for any setup with `MAX < 100` mm³/s.
 
 ---
 
@@ -310,18 +319,27 @@ stealthchop_threshold: 999999    # forces StealthChop — Trinamic-supported but
 [tmc_flow_test]
 extruder_stepper: extruder       # ADAPT: stepper section name
 filament_diameter: 1.75          # ADAPT: 1.75 or 2.85
-melt_zone_length: 42             # ADAPT: hotend melt-zone length (Sherpa Mini ~42, V6 ~12, Volcano ~21)
+melt_zone_length: 42             # ADAPT: hotend melt-zone length (see below)
 
 # Optional:
 #min_hotend_temp: 180            # safety floor, default 180
 #output_dir: ~/printer_data/config/Flowtest
 ```
 
+> **`melt_zone_length` matters more than you'd think.** The plugin uses this to compute residence time (how long each piece of filament spends in the heated zone) and to display reference lines for hotend classes (V6 ≥1.5 s, Volcano ≥0.6 s, CHT ≥0.3 s) on the thermal chart. Wrong values give misleading hotend-class hints.
+>
+> Typical values:
+> - **V6 / Revo Six**: ~12–15 mm
+> - **Volcano**: ~21 mm
+> - **Mosquito**: ~18 mm
+> - **Sherpa Mini / similar high-flow**: ~42 mm
+> - **Goliath / Bondtech CHT-XL**: ~50 mm
+
 ### SFILT — keep it on
 
 `driver_SFILT: 1` enables the StallGuard hardware filter (averages SG over 4 cycles). The plugin's slip detection thresholds are **calibrated against filtered SG signal** — running with `driver_SFILT: 0` produces noisy per-sample variance that triggers false positives in the coarse phase.
 
-If you've previously run the test with `SFILT=0` and got early triggers (e.g. at flow=50), set `driver_SFILT: 1`, FIRMWARE_RESTART, and re-test.
+If you've previously run the test with `SFILT=0` and got early triggers (e.g. at flow=50), set `driver_SFILT: 1`, restart Klipper, and re-test.
 
 ### CoolStep — what about it?
 
@@ -343,10 +361,13 @@ Each TMC chip family supports StallGuard only in one specific chopper mode:
 |---|---|---|
 | TMC5160 / TMC2130 / TMC2660 | SG2 | **SpreadCycle** (Klipper default — **don't add `stealthchop_threshold`**) |
 | TMC2240 | SG2 *(used by this plugin)* | **SpreadCycle** (don't add `stealthchop_threshold`) |
+| TMC2209 | SG4 | **SpreadCycle** (experimental, see above) or StealthChop (lower torque) |
 
 > **`stealthchop_threshold: 0` is NOT the same as "no line".** It enables StealthChop with threshold 0, which breaks SG2. For SG2 drivers, **remove the line entirely**.
 
 If you're not sure what mode you're in, run `TMC_FLOW_STATUS` — the plugin checks the configuration and tells you what's wrong. Or `DUMP_TMC STEPPER=extruder` and check `en_pwm_mode` (1 = StealthChop) and `tpwmthrs` (1048575 = pure SpreadCycle).
+
+> **TMC2209 flag note:** TMC2209 inverts the StealthChop bit semantics. Its `en_spreadcycle` GCONF bit reads as 1 when SpreadCycle is active — opposite of the SG2 chips' `en_pwm_mode`. The plugin handles this internally.
 
 ---
 
@@ -389,16 +410,36 @@ The output ends with a **Recommendation** block telling you which chopper mode t
 
 ## How it works
 
-The plugin samples StallGuard at 20 Hz during each measurement step (5 repeats × 5 s by default) and tracks median, IQR (P25–P75), and run-to-run CV per step. Slip detection uses **multiple independent triggers** that look for different signatures:
+The plugin samples StallGuard at 20 Hz during each measurement step (5 repeats × 5 s by default) and tracks per-step median, IQR (P25–P75), run-to-run CV, and intra-run trend (slope of SG over time within a single run). Slip detection uses **multiple independent triggers** that look for different signatures:
 
-- **SG signal patterns** — snap-back, over-jump, plateau (with saturation-skip and median-baseline)
+- **SG signal patterns** — snap-back, over-jump, single-step plateau, 2-step cumulative plateau (with saturation-skip and median-baseline)
 - **Run-to-run variance** — CV spike, CV jump, rising trend, vs coarse-baseline
-- **Sample distribution** — IQR widening, IQR vs coarse-baseline, IQR absolute
+- **Sample distribution** — IQR widening (single-step), IQR cumulative growth (vs early-test baseline), IQR vs coarse-baseline, IQR absolute floor
 - **Per-run analysis** — single-run outlier detection (warmup-aware), SG max spike for decoupling
 
 Each trigger fires under tighter conditions in **bisection / verify** than in coarse, so the coarse phase stays noise-resistant while the final result is accurate to ±1 mm³/s.
 
 The HTML report's **decision-trail panel** lists every trigger event with the metrics that caused it, so you can see exactly why the plugin chose the value it did.
+
+### New triggers in v3.1
+
+Two triggers were added in v3.1 to catch slip patterns that older versions missed:
+
+- **Single-step plateau** — fires when the most recent step's SG-delta is essentially flat compared to the recent baseline (e.g. typical −25 deltas then suddenly +0.5). Catches abrupt plateaus that the 2-step cumulative trigger would smooth over.
+- **IQR cumulative growth** — fires when within-step spread has gradually doubled relative to the early-test baseline AND now exceeds an absolute floor of 12 raw units. Catches gradual stick-slip onset that single-step ratio triggers don't see.
+
+### Thermal monitoring (informational)
+
+During every measurement the plugin captures heater PWM (avg/max), hotend temperature (target/actual/min/drop), and TMC driver thermal flags (otpw / ot). These appear in the CSV and HTML report. **They do NOT trigger anything** — they're context for interpreting the result.
+
+A heuristic 0–100 **thermal stress score** is computed per step combining five signals:
+1. Heater PWM level (0–30 points)
+2. Temperature drop from target (0–25 points)
+3. PWM rising trend vs early-test baseline (0–15 points)
+4. PWM peak saturation hits (0–10 points)
+5. Intra-run SG drift (0–20 points) — load growing within a single run = cold extrusion fingerprint
+
+The chart backgrounds get tinted: green (0–30 stable) / yellow (30–60 moderate) / red (60+ likely cold extrusion). The first flow where score crosses 30 is marked as "cold extrusion onset" — purely visual, doesn't affect detection.
 
 ### Warmup-skip
 
@@ -432,7 +473,7 @@ Run the StallGuard-based flow test (Auto-SGT → Coarse → Bisection → Verifi
 |---|---|---|
 | `START` | 10 | Starting flow (mm³/s) |
 | `MAX` | 80 | Upper search bound |
-| `COARSE_STEP` | 10 | Coarse sweep step size |
+| `COARSE_STEP` | 10 | Coarse sweep step size (use 5 for low-flow setups) |
 | `MIN_STEP` | 1 | Bisection precision |
 | `DURATION` | 5 | Seconds per measurement |
 | `REPEAT` | 5 | Repetitions per measurement |
@@ -470,20 +511,26 @@ Empirical pre-flight check: probes SG_RESULT in both StealthChop and SpreadCycle
 ## Examples
 
 ```
-# Standard test (TMC5160/2240 with Auto-SGT on by default)
-TMC_FLOW_FIND_MAX MAX=150 START=10
+# Recommended test for most setups (TMC5160/2240, ~50 mm³/s expected)
+TMC_FLOW_FIND_MAX MAX=120 START=15 COARSE_STEP=5
+
+# High-flow setup (Goliath, Bondtech CHT 0.8)
+TMC_FLOW_FIND_MAX MAX=150 START=25 COARSE_STEP=5
+
+# Low-flow setup (V6 stock 0.4)
+TMC_FLOW_FIND_MAX MAX=30 START=5 COARSE_STEP=5
 
 # Same test, but keep the tuned SGT after test ends
-TMC_FLOW_FIND_MAX MAX=150 START=10 KEEP_SGT=1
+TMC_FLOW_FIND_MAX MAX=150 START=10 COARSE_STEP=5 KEEP_SGT=1
 
 # Skip Auto-SGT and use your configured SGT directly
 TMC_FLOW_FIND_MAX MAX=150 START=10 AUTO_SGT=0
 
 # Quicker, less accurate
-TMC_FLOW_FIND_MAX REPEAT=3 VERIFY_REPEATS=3 COOLDOWN=10
+TMC_FLOW_FIND_MAX REPEAT=3 VERIFY_REPEATS=3 COOLDOWN=10 COARSE_STEP=10
 
 # More accurate (longer)
-TMC_FLOW_FIND_MAX REPEAT=10 DURATION=8 VERIFY_REPEATS=10
+TMC_FLOW_FIND_MAX REPEAT=10 DURATION=8 VERIFY_REPEATS=10 COARSE_STEP=5
 
 # Diagnostic check
 TMC_FLOW_STATUS
@@ -502,24 +549,53 @@ TMC_FLOW_FIND_MAX MAX=150 START=30 AUTO_SGT=0
 Files saved to `~/printer_data/config/Flowtest/`:
 
 ```
-tmc_flow_YYYY-MM-DD_HH-MM-SS.csv     ← raw data
-tmc_flow_YYYY-MM-DD_HH-MM-SS.html    ← interactive report
+tmc_flow_YYYY-MM-DD_HH-MM-SS.csv     ← raw data, 23 columns
+tmc_flow_YYYY-MM-DD_HH-MM-SS.html    ← interactive dashboard report
 ```
 
-The HTML report includes:
-- **Result panel** — max safe flow, slicer recommendations (80 % / 90 %)
-- **Decision trail** — every trigger event with the "healthy ranges" that defined what was considered normal
-- **SG vs flow chart** with median + IQR, phase markers, and trigger annotations marking exactly where slip was detected
-- **TMC settings snapshot** at test start (collapsible) for reproducible documentation
+### HTML report structure
 
-The CSV header includes the same TMC settings block for paper-trail purposes.
+The v3.1 report is a complete dashboard rewrite with:
+
+- **Hero panel** — big result number (max safe flow) with 80 % / 90 % slicer recommendations and a status pill
+- **Insight cards** — 4 colour-coded summaries: result quality, first trigger, thermal watch (with stress-score state), driver config
+- **Tabbed charts**:
+  - **StallGuard signal** — median + P25–P75 band + average, with phase markers, trigger annotations, and three-zone background colouring (green / yellow / red)
+  - **Thermal profile** — heater PWM, hotend temperature, residence time per step, with V6 / Volcano / CHT reference lines
+  - **Run-to-run variance** — CV bar chart per step, coloured by severity vs the trigger threshold
+- **Decision timeline** — phase-by-phase summary of why the result was chosen (coarse sweep → trigger → bisect → verify)
+- **Test details** (collapsible) — full data table, test configuration, TMC settings snapshot, decision trail with trigger metrics
+- **Reference** (collapsible) — glossary explaining all metrics in plain language
+
+### CSV columns
+
+23 columns total. Slip detection columns (sg_median, sg_p25, sg_p75, sg_run_cv_pct, run_sg_avgs) plus thermal telemetry:
+
+```
+phase, flow_mm3s, sg_median, sg_p25, sg_p75, sg_avg, sg_min, sg_max, sg_n,
+n_repeats, sg_run_cv_pct, run_sg_avgs,
+temp_target, temp_start, temp_end, temp_min, temp_avg, temp_drop,
+pwm_min, pwm_max, pwm_avg, tmc_otpw, tmc_ot
+```
+
+The CSV header includes the same TMC settings block as the HTML for paper-trail purposes.
 
 ---
 
 ## Troubleshooting
 
+**`Section 'tmc_flow_test' is not a valid config section`** —
+The plugin file isn't being loaded. Common causes:
+1. File at wrong path → must be `~/klipper/klippy/extras/tmc_flow_test.py`
+2. Service not restarted → run `sudo systemctl restart klipper` (NOT `FIRMWARE_RESTART`)
+3. Stale Python cache → `rm -f ~/klipper/klippy/extras/__pycache__/tmc_flow_test*.pyc` then restart
+4. **Kalico**: see compatibility note below — make sure your file is from v3.1 or later
+
+**Plugin throws `ImportError: attempted relative import with no known parent package`** —
+You're on Kalico (or another Klipper fork) that ships its own `extras/statistics.py`, which shadows Python's stdlib `statistics`. **v3.1 fixes this** — make sure you have the latest plugin (no `import statistics` at top of file).
+
 **`TMC_FLOW_STATUS` reports "StallGuard2 needs SpreadCycle"** *(SG2 drivers — TMC5160, TMC2130, TMC2240)* —
-Remove the `stealthchop_threshold:` line entirely from your TMC section, `FIRMWARE_RESTART`. For TMC2240: also remove any `[delayed_gcode]` block that sets `sg4_thrs` or `sg4_filt_en` — they're not needed in SG2 mode.
+Remove the `stealthchop_threshold:` line entirely from your TMC section, restart Klipper. For TMC2240: also remove any `[delayed_gcode]` block that sets `sg4_thrs` or `sg4_filt_en` — they're not needed in SG2 mode.
 
 **Auto-SGT can't reach target range** —
 Console says "could not reach target range" after 5 iterations. Usually means your SGT is at an extreme (e.g. -64 or +63) and still doesn't produce useful SG values. Check your `run_current` — if it's very low, even max-sensitive SGT may not see enough load. Try increasing `run_current` slightly or running with `AUTO_SGT=0` and a manually-chosen SGT.
@@ -533,6 +609,9 @@ Most common causes:
 **Test reaches MAX without trigger** —
 Either your hotend really can flow that fast (raise MAX), or SG sensitivity is still too low. Check the Auto-SGT output — if it tuned to a very high SGT (e.g. > 30), your motor torque headroom is bigger than the test's MAX value.
 
+**Test ends without trigger and the chart shows a clear plateau** —
+This used to happen when `COARSE_STEP=10` skipped over a fast plateau onset. v3.1 added a single-step plateau trigger that catches this. If you see this on v3.1, lower `COARSE_STEP` to 5 — the IQR cumulative growth trigger needs ≥5 coarse steps of history to fire.
+
 **TMC2240 results much lower than expected (<70 mm³/s on a fast extruder)** —
 Check that you're running in **SpreadCycle/SG2** mode, not StealthChop/SG4. The SG4 path of the TMC2240 reduces peak torque by ~50 %. `TMC_FLOW_STATUS` will tell you which mode is active. Remove `stealthchop_threshold` from your `[tmc2240]` section if present.
 
@@ -544,6 +623,9 @@ The plugin works fine with CoolStep on, but for the most conservative result set
 
 **Auto-SGT keeps tuning to the same value as my config** —
 That's fine — it confirms your SGT is already optimal. The console will say "current SGT=N already optimal — no change needed".
+
+**Thermal stress score (yellow/red zones) appears even though my heater seems fine** —
+The score combines five signals; PWM peaks above 95 %, drops above 5 °C, or large intra-run SG drift each contribute. Check the chart's tooltip to see which component dominates. If only intra-run drift is high while PWM and temperature look stable, that often indicates the filament was getting harder to push during runs — possible cold extrusion or filament tangling.
 
 ### TMC2209-specific (experimental)
 
@@ -567,6 +649,18 @@ Expected risk with the experimental TMC2209 path. The Trinamic-supported way is 
 1. Drop the slicer max-flow value 20 % below what the plugin reported
 2. Re-test with `stealthchop_threshold: 999999` for the conservative documented mode
 3. Switch to TMC2240 for a guaranteed-reliable result
+
+---
+
+## Compatibility
+
+| Software | Status |
+|---|---|
+| **Klipper** (vanilla) | ✅ Tested |
+| **Kalico** | ✅ Tested (v3.1+, with the `_pstdev` local stdlib workaround) |
+| **DangerKlipper** | ✅ Should work (same plugin path) |
+
+The plugin uses only stdlib Python imports plus Klipper's `gcode`, `pins`, and `tmc` modules — no external dependencies.
 
 ---
 
