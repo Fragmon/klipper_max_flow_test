@@ -3811,4 +3811,1540 @@ new Chart(document.getElementById('cvChart'), {
                 "other repeats, %.1fx MAD) — at least one of the "
                 "repeats stalled while the others ran clean"
                 % (original_run_num, run_sg[outlier_idx],
-           
+                   median_rest, outlier_dev / mad_rest))
+
+    def _is_borderline(self, results):
+        """Detect if the latest bisection step sits in a 'gray zone'
+        — not clearly safe but not clearly stalled either.
+
+        Returns a string explaining why it's borderline, or None if
+        the result is conclusive.
+
+        Used by the bisection loop to decide whether to re-test the
+        same flow before classifying it as safe or as a trigger.
+
+        Heuristic: look at CV and IQR vs the coarse-phase baselines.
+        Confidence ranges:
+          - CV in coarse: typically 1-3% on a stable SG2 setup
+          - CV >= 7% in bisection AND >= 3x coarse baseline: clearly slip
+          - CV < 4% in bisection: clearly safe
+          - CV in 4-6.9% range, OR 2-3x coarse baseline: BORDERLINE
+          - IQR >= 25 in bisection: clearly slip (already trigger (c))
+          - IQR < 15: clearly safe
+          - IQR 15-24: BORDERLINE
+        """
+        if not results:
+            return None
+        last = results[-1]
+        if last.get('phase') not in ('bisect', 'verify'):
+            return None
+        last_rc = last.get('run_consistency') or {}
+        last_cv = last_rc.get('sg_cv')
+        sg_stats = last.get('sg') or {}
+        if 'p25' not in sg_stats or 'p75' not in sg_stats:
+            return None
+        last_iqr = sg_stats['p75'] - sg_stats['p25']
+
+        # Build coarse-phase reference
+        coarse_cvs = []
+        coarse_iqrs = []
+        for r in results[:-1]:
+            if r.get('phase', 'coarse') != 'coarse':
+                continue
+            rc = r.get('run_consistency') or {}
+            sg_p = r.get('sg') or {}
+            if 'sg_cv' in rc:
+                coarse_cvs.append(rc['sg_cv'])
+            if 'p25' in sg_p and 'p75' in sg_p:
+                coarse_iqrs.append(sg_p['p75'] - sg_p['p25'])
+        if len(coarse_cvs) < 4:
+            return None  # not enough baseline for comparison
+
+        # Use median-of-coarse (excluding last coarse step which may be
+        # the elevated one that triggered bisection)
+        sorted_cv = sorted(coarse_cvs[:-1])
+        n = len(sorted_cv)
+        coarse_med_cv = (sorted_cv[n // 2] if n % 2
+                         else (sorted_cv[n // 2 - 1]
+                               + sorted_cv[n // 2]) / 2)
+        sorted_iqr = sorted(coarse_iqrs[:-1])
+        n = len(sorted_iqr)
+        coarse_med_iqr = (sorted_iqr[n // 2] if n % 2
+                          else (sorted_iqr[n // 2 - 1]
+                                + sorted_iqr[n // 2]) / 2)
+
+        # CV gray zone: elevated but not screaming
+        cv_borderline = (last_cv is not None
+                         and self.profile.BORDER_CV_LOW <= last_cv
+                                                       < self.profile.BORDER_CV_HIGH
+                         and (coarse_med_cv < 1
+                              or last_cv >=
+                                  self.profile.BORDER_CV_RATIO
+                                  * coarse_med_cv))
+
+        # IQR gray zone: wide but not extreme. Cross-check with CV — a
+        # widened IQR with a very LOW CV is usually just one outlier
+        # sample stretching the percentiles, not real intermittent
+        # slip. Genuine slip widens both spread and run-to-run noise.
+        # We require CV at least BORDER_IQR_CV_FLOOR (more than typical
+        # clean noise) for IQR-only borderlines to count.
+        iqr_borderline = (self.profile.BORDER_IQR_LOW <= last_iqr
+                                                      < self.profile.BORDER_IQR_HIGH
+                          and (coarse_med_iqr < 1
+                               or last_iqr >=
+                                   self.profile.BORDER_IQR_RATIO
+                                   * coarse_med_iqr)
+                          and last_cv is not None
+                          and last_cv >= self.profile.BORDER_IQR_CV_FLOOR)
+
+        if cv_borderline and iqr_borderline:
+            return ("CV %.1f%% (vs coarse ~%.1f%%) AND IQR %.0f "
+                    "(vs coarse ~%.0f) both in borderline range"
+                    % (last_cv, coarse_med_cv,
+                       last_iqr, coarse_med_iqr))
+        if cv_borderline:
+            return ("CV %.1f%% in borderline range (coarse baseline "
+                    "~%.1f%%, clear trigger >=7%%)"
+                    % (last_cv, coarse_med_cv))
+        if iqr_borderline:
+            return ("IQR %.0f in borderline range (coarse baseline "
+                    "~%.0f, clear trigger >=25)"
+                    % (last_iqr, coarse_med_iqr))
+        return None
+
+    def _coarse_baseline_stats(self, results):
+        """Compute "healthy" CV and IQR ranges from the coarse phase.
+
+        Used by the HTML report to show the user what was considered
+        normal during the slip-free portion of the test, so trigger
+        events can be interpreted in context.
+
+        Returns dict with keys:
+            cv_min, cv_median, cv_max, cv_mean
+            iqr_min, iqr_median, iqr_max, iqr_mean
+            n_steps
+        Returns None if there's not enough coarse data.
+        """
+        coarse_cvs = []
+        coarse_iqrs = []
+        for r in results:
+            if r.get('phase', 'coarse') != 'coarse':
+                continue
+            rc = r.get('run_consistency') or {}
+            sg_p = r.get('sg') or {}
+            if 'sg_cv' in rc:
+                coarse_cvs.append(rc['sg_cv'])
+            if 'p25' in sg_p and 'p75' in sg_p:
+                coarse_iqrs.append(sg_p['p75'] - sg_p['p25'])
+        # Drop the LAST coarse step (likely the one that triggered).
+        # Only do so if we have enough data; otherwise keep them all.
+        if len(coarse_cvs) >= 4:
+            coarse_cvs = coarse_cvs[:-1]
+        if len(coarse_iqrs) >= 4:
+            coarse_iqrs = coarse_iqrs[:-1]
+
+        if not coarse_cvs or not coarse_iqrs:
+            return None
+
+        def _median(xs):
+            s = sorted(xs)
+            n = len(s)
+            return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+        return {
+            'cv_min': min(coarse_cvs),
+            'cv_max': max(coarse_cvs),
+            'cv_median': _median(coarse_cvs),
+            'cv_mean': sum(coarse_cvs) / len(coarse_cvs),
+            'iqr_min': min(coarse_iqrs),
+            'iqr_max': max(coarse_iqrs),
+            'iqr_median': _median(coarse_iqrs),
+            'iqr_mean': sum(coarse_iqrs) / len(coarse_iqrs),
+            'n_steps': len(coarse_cvs),
+        }
+
+    # ─── Helper: rotation_distance lookup ───────────────────────────
+
+    def _get_rotation_distance(self, extruder):
+        try:
+            rd = extruder.extruder_stepper.stepper.get_rotation_distance()
+            return rd[0] if isinstance(rd, tuple) else rd
+        except AttributeError:
+            pass
+        try:
+            rd = extruder.stepper.get_rotation_distance()
+            return rd[0] if isinstance(rd, tuple) else rd
+        except AttributeError:
+            pass
+        try:
+            cfg = self.printer.lookup_object('configfile')
+            settings = cfg.get_status(
+                self.reactor.monotonic())['settings']
+            return float(settings[self.stepper_name]['rotation_distance'])
+        except Exception:
+            return None
+
+    # ─── TMC_FLOW_STATUS — diagnostic ───────────────────────────────
+
+    def cmd_TMC_FLOW_STATUS(self, gcmd):
+        """Show current TMC SG values and configuration status."""
+        self._lookup_tmc()
+        activate = gcmd.get_int('ACTIVATE', 1, minval=0, maxval=1)
+
+        if activate:
+            gcmd.respond_info("Activating motor (1 mm extrusion)...")
+            self.gcode.run_script_from_command(
+                "M83\nG1 E1 F60\nM400\nG92 E0")
+
+        gcmd.respond_info(
+            "===== TMC %s Status (stepper '%s') ====="
+            % (self.driver_type or 'unknown', self.stepper_name))
+
+        sg = self._read_sg()
+        sg_label = self._get_sg_label()
+        gcmd.respond_info(
+            "%s: %s (range 0-510, lower = more load)"
+            % (sg_label, str(sg) if sg is not None else 'n/a'))
+
+        # Run config check
+        problems, infos = self._check_tmc_config()
+        if problems:
+            gcmd.respond_info("Configuration issues found:")
+            for fname, val, _desc in problems:
+                gcmd.respond_info("  ⚠ %s = %s" % (fname, val))
+        else:
+            gcmd.respond_info("✓ Configuration looks good.")
+        for info in infos:
+            gcmd.respond_info(info)
+
+    def _snapshot_tmc_settings(self):
+        """Read TMC register state most relevant to this test.
+
+        Captures only the fields that affect StallGuard / CoolStep
+        behaviour during the flow test, so the report has a short and
+        focused paper trail of the configuration that produced the
+        result. Missing fields are skipped silently.
+        """
+        snapshot = []
+        if self.tmc is None:
+            return snapshot
+
+        def get(name):
+            try:
+                return self.tmc.fields.get_field(name)
+            except (KeyError, AttributeError):
+                return None
+
+        def add(label, name):
+            v = get(name)
+            if v is None:
+                return
+            snapshot.append((label, str(v), name))
+
+        # Identity
+        snapshot.append(("Driver", str(self.driver_type or '?'),
+                         'driver_type'))
+        snapshot.append(("Stepper", str(self.stepper_name or '?'),
+                         'stepper_name'))
+
+        # Chopper mode (decides which StallGuard engine works)
+        add("en_pwm_mode (1=StealthChop)", 'en_pwm_mode')
+        add("en_spreadCycle (1=SpreadCycle, TMC2209)", 'en_spreadCycle')
+
+        # Velocity gates that govern StallGuard / CoolStep activity
+        add("TPWMTHRS (StealthChop velocity threshold)", 'tpwmthrs')
+        add("TCOOLTHRS (CoolStep / StallGuard velocity threshold)",
+            'tcoolthrs')
+        add("THIGH (full-step velocity threshold)", 'thigh')
+
+        # StallGuard sensitivity
+        add("SGTHRS (TMC2209 StallGuard4 threshold)", 'sgthrs')
+        add("SGT (StallGuard2 threshold, signed -64..+63)", 'sgt')
+        add("sg4_thrs (StallGuard4 threshold, TMC2240)", 'sg4_thrs')
+        add("sg4_filt_en (SG4 filter enabled)", 'sg4_filt_en')
+        add("SFILT (SG2 filter enabled)", 'sfilt')
+
+        # CoolStep configuration
+        add("SEMIN (CoolStep lower threshold = SEMIN*32)", 'semin')
+        add("SEMAX (CoolStep upper threshold offset)", 'semax')
+        add("SEUP (current-up step size)", 'seup')
+        add("SEDN (current-down step size)", 'sedn')
+        add("SEIMIN (CoolStep min current; 0=1/2 IRUN, 1=1/4)",
+            'seimin')
+
+        # Run-time current state
+        add("IRUN (run current scale 0..31)", 'irun')
+
+        return snapshot
+
+    # ─── Auto-SGT tuning ────────────────────────────────────────────
+
+    def _can_autotune_sgt(self):
+        """Return True if the current driver supports automatic SGT
+        tuning. Currently only signed-SGT (SG2) drivers are supported:
+        TMC5160, TMC2130, TMC2240. TMC2209 (SG4) and TMC2660 are
+        skipped — they have different field semantics.
+        """
+        if self.tmc is None:
+            return False
+        if self.is_2209:
+            return False  # SG4 with SGTHRS — not yet supported
+        # Verify the sgt field actually exists on this driver
+        try:
+            self.tmc.fields.get_field('sgt')
+            return True
+        except (KeyError, AttributeError):
+            return False
+
+    def _set_sgt(self, value):
+        """Set the SGT field via SET_TMC_FIELD. Returns True on success."""
+        try:
+            self.gcode.run_script_from_command(
+                "SET_TMC_FIELD STEPPER=%s FIELD=sgt VALUE=%d"
+                % (self.stepper_name, int(value)))
+            return True
+        except Exception as e:
+            logging.exception("tmc_flow_test: failed to set sgt: %s" % e)
+            return False
+
+    def _probe_sg_at_flow(self, gcmd, flow, duration, repeat,
+                           skip_warmup=True):
+        """Run a multi-repeat extrusion at the given flow and return
+        SG statistics (median, p25, p75, cv). Used for the auto-SGT
+        tuning probe. Wraps _measure_step so we get the full statistical
+        treatment (warmup-skip, median, IQR, run-to-run CV) rather than
+        a noisy single-shot average.
+
+        skip_warmup: if True (default), the first repetition is
+        excluded if it deviates from the rest. Set to False for
+        diagnostic measurements where you want the unfiltered raw
+        signal — useful when the SG signal itself is degenerate (e.g.
+        TMC2209 SG4 producing only a few discrete values).
+
+        Returns dict with 'median', 'cv', 'min', 'max' or None on failure.
+        """
+        # _measure_step does its own gcode run + sampling + warmup-skip
+        result = self._measure_step(gcmd, flow, duration, repeat,
+                                     skip_warmup=skip_warmup)
+        if not result or not result.get('sg'):
+            return None
+        sg = result['sg']
+        rc = result.get('run_consistency') or {}
+        return {
+            'median': sg.get('median'),
+            'p25': sg.get('p25'),
+            'p75': sg.get('p75'),
+            'min': sg.get('min'),
+            'max': sg.get('max'),
+            'cv': rc.get('sg_cv', 0),
+            'warmup_dropped': result.get('warmup_dropped', False),
+        }
+
+    def _autotune_sgt(self, gcmd, start_flow):
+        """Pre-test SGT auto-tuning probe.
+
+        Runs short low-flow probes and adjusts SGT until SG_RESULT
+        sits in the profile's target range (SGT_LOW_TARGET_MIN .. MAX).
+        This guarantees the main test starts with adequate dynamic
+        range, which is the single biggest factor for accurate
+        slip detection.
+
+        Probe flow strategy: probes AT the user's START flow.
+        Reason: SGT effects on the SG-vs-load curve are flow-dependent.
+        If we probe at flow=5 but the test actually starts at flow=10,
+        the SGT we tune for flow=5 will produce a less-than-target SG
+        value at flow=10 — leaving the early test steps with too
+        little dynamic range, which makes the natural SG-vs-load
+        saturation curve look like a "plateau" trigger and produces
+        false-positive slip detections in the coarse phase.
+        Probing at start_flow makes the calibration directly
+        relevant to where the test begins.
+
+        SGT semantics (signed -64..+63):
+          higher SGT  →  less sensitive  →  higher SG_RESULT values
+          lower SGT   →  more sensitive  →  lower SG_RESULT values
+
+        On exit, the SGT register holds the tuned value. Returns
+        (original_sgt, final_sgt) so the caller can either restore the
+        original (recommended for safety) or keep the tuned value
+        for the test run. The console output recommends the tuned
+        value for permanent inclusion in printer.cfg.
+        """
+        if not self._can_autotune_sgt():
+            gcmd.respond_info(
+                "Auto-SGT skipped: driver doesn't support sgt field "
+                "tuning (TMC2209/SG4 not yet supported).")
+            return None, None
+
+        try:
+            original_sgt = self.tmc.fields.get_field('sgt')
+        except (KeyError, AttributeError):
+            gcmd.respond_info(
+                "Auto-SGT skipped: could not read current sgt value.")
+            return None, None
+
+        sgt_min = self.profile.SGT_RANGE_MIN
+        sgt_max = self.profile.SGT_RANGE_MAX
+        target_min = self.profile.SGT_LOW_TARGET_MIN
+        target_max = self.profile.SGT_LOW_TARGET_MAX
+        # Probe AT the user's START flow, not a fixed lower value.
+        # The reason: SGT calibration is flow-dependent. If we probe
+        # at flow=5 but the test starts at flow=10, the SGT we tuned
+        # for flow=5 will produce a smaller SG range at flow=10 than
+        # expected — leaving us in or near the target band ONLY at
+        # flow=5, and below it from flow=10 onwards. That triggers
+        # plateau false-positives later (the curve looks flat because
+        # SG has already collapsed to the lower end of the scale).
+        # Probing at start_flow guarantees the scale is calibrated
+        # for the load the test actually begins with.
+        probe_flow = start_flow
+        probe_duration = self.profile.SGT_AUTOTUNE_PROBE_DURATION
+        probe_repeats = self.profile.SGT_AUTOTUNE_PROBE_REPEATS
+        max_iter = self.profile.SGT_AUTOTUNE_MAX_ITERATIONS
+
+        gcmd.respond_info(
+            "===== Auto-SGT tuning =====\n"
+            "Probing SG_RESULT at %.1f mm³/s (%d reps × %.1f s)\n"
+            "Target range at low load: SG_RESULT %d-%d (median)\n"
+            "Current SGT: %d (range %d..%d)"
+            % (probe_flow, probe_repeats, probe_duration,
+               target_min, target_max,
+               original_sgt, sgt_min, sgt_max))
+
+        cur_sgt = original_sgt
+        history = []  # [(sgt, sg_median, cv), ...]
+
+        for iteration in range(max_iter):
+            stats = self._probe_sg_at_flow(gcmd, probe_flow,
+                                            probe_duration, probe_repeats)
+            if stats is None or stats.get('median') is None:
+                gcmd.respond_info(
+                    "  iteration %d: SGT=%d → no SG samples (skipping)"
+                    % (iteration + 1, cur_sgt))
+                break
+
+            sg_med = stats['median']
+            sg_cv = stats.get('cv', 0)
+            sg_max = stats.get('max', 0)
+            history.append((cur_sgt, sg_med, sg_cv))
+
+            # In-range check: median must be in target range AND no
+            # samples saturated. Saturation at probe-flow guarantees
+            # saturation at the test's actual start_flow (which is
+            # higher than probe), so we treat any 1023 samples as
+            # "SGT too high" even if the median looks acceptable.
+            saturated = sg_max >= 1023
+            in_range = (target_min <= sg_med <= target_max
+                        and not saturated)
+
+            if in_range:
+                status = "✓ in range"
+            elif saturated and target_min <= sg_med <= target_max:
+                status = "saturated samples — SGT too high"
+            else:
+                status = "needs adjustment"
+            sat_note = " [max=1023 saturated!]" if saturated else ""
+            gcmd.respond_info(
+                "  iteration %d: SGT=%d → SG median=%.0f, CV=%.1f%%, "
+                "max=%.0f (%s)%s"
+                % (iteration + 1, cur_sgt, sg_med, sg_cv, sg_max,
+                   status, sat_note))
+
+            if in_range:
+                break
+
+            # Decide adjustment direction. Saturation forces "lower SGT"
+            # regardless of median (the median is misleading if upper
+            # samples are clipped to 1023).
+            if saturated:
+                # Always lower SGT when samples saturated
+                step = 5 if sg_med > 1000 else 3
+                new_sgt = max(sgt_min, cur_sgt - step)
+            elif sg_med < target_min:
+                # Too sensitive — raise SGT
+                step = 5 if sg_med < target_min / 2 else 3
+                new_sgt = min(sgt_max, cur_sgt + step)
+            else:
+                # Above target_max but not saturated — lower SGT
+                step = 3
+                new_sgt = max(sgt_min, cur_sgt - step)
+
+            if new_sgt == cur_sgt:
+                gcmd.respond_info(
+                    "  Reached SGT bound (%d) without entering target "
+                    "range — stopping." % cur_sgt)
+                break
+
+            cur_sgt = new_sgt
+            if not self._set_sgt(cur_sgt):
+                gcmd.respond_info(
+                    "  Failed to write SGT=%d — aborting auto-tune."
+                    % cur_sgt)
+                cur_sgt = original_sgt
+                self._set_sgt(original_sgt)
+                break
+
+        else:
+            gcmd.respond_info(
+                "  Reached max iterations (%d) without entering target "
+                "range." % max_iter)
+
+        # Final report. The loop above uses (median in range AND not
+        # saturated) as the success condition — and breaks out of the
+        # loop on the first successful iteration. So if the loop
+        # exited on success, the LAST history entry is the in-range
+        # one. We use the same in-range definition here.
+        last_sg = history[-1][1] if history else None
+        final_sgt = cur_sgt
+        in_target = (last_sg is not None
+                     and target_min <= last_sg <= target_max)
+        if in_target:
+            if final_sgt != original_sgt:
+                gcmd.respond_info(
+                    "Auto-SGT: tuned to SGT=%d (was %d).\n"
+                    "→ For a permanent fix, add to your "
+                    "[%s extruder] section:\n"
+                    "    driver_SGT: %d\n"
+                    "Continuing test with tuned SGT..."
+                    % (final_sgt, original_sgt,
+                       self.driver_type, final_sgt))
+            else:
+                gcmd.respond_info(
+                    "Auto-SGT: current SGT=%d already optimal — "
+                    "no change needed."
+                    % original_sgt)
+        else:
+            gcmd.respond_info(
+                "Auto-SGT: could not reach target range. "
+                "Continuing with SGT=%d (last SG median=%s).\n"
+                "  → Consider manually tuning SGT and re-running."
+                % (final_sgt,
+                   "%.0f" % last_sg if last_sg is not None else "n/a"))
+
+        return original_sgt, final_sgt
+
+    def _restore_sgt_if_needed(self, gcmd, original_sgt, final_sgt,
+                                keep_sgt, announce=True):
+        """Restore SGT to its original value unless keep_sgt is set
+        or the auto-tune was a no-op. Safe to call multiple times."""
+        if (original_sgt is None
+                or final_sgt is None
+                or final_sgt == original_sgt):
+            return  # nothing to do
+        if keep_sgt:
+            if announce:
+                gcmd.respond_info(
+                    "Auto-SGT: KEEP_SGT=1 — leaving SGT=%d active "
+                    "until next FIRMWARE_RESTART." % final_sgt)
+            return
+        if self._set_sgt(original_sgt):
+            if announce:
+                gcmd.respond_info(
+                    "Auto-SGT: restored original SGT=%d "
+                    "(test ran with tuned SGT=%d). To make the "
+                    "tuned value permanent, add to your config:\n"
+                    "    driver_SGT: %d"
+                    % (original_sgt, final_sgt, final_sgt))
+        else:
+            if announce:
+                gcmd.respond_info(
+                    "Auto-SGT: WARNING failed to restore original "
+                    "SGT=%d. Run FIRMWARE_RESTART to reset."
+                    % original_sgt)
+
+    # ─── TMC_FLOW_TEST_SG_VARIANTS ─────────────────────────────────
+    # Diagnostic for TMC2209 only. Trinamic states StallGuard4 is
+    # "intended for StealthChop mode, only" but doesn't categorically
+    # state it returns nothing in SpreadCycle. Different production
+    # batches and motor combinations give wildly different behaviour
+    # in SpreadCycle. This command runs the same probe in BOTH chopper
+    # modes and tells the user empirically what their hardware does.
+    #
+    # Why this matters: TMC2209 in SpreadCycle delivers ~50 % more
+    # peak torque than in StealthChop, so if a particular hardware
+    # combo happens to produce a usable SG signal in SpreadCycle, the
+    # user could get significantly higher max-flow results.
+
+    def _save_tmc2209_chopper_state(self):
+        """Snapshot TMC2209 chopper-mode-relevant fields for restore.
+
+        TMC2209 uses different field names than TMC5160:
+          - TMC2209 GCONF Bit 2 = 'en_spreadcycle' (1=SpreadCycle, 0=StealthChop)
+          - TMC5160 GCONF Bit 2 = 'en_pwm_mode'    (1=StealthChop, 0=SpreadCycle)
+        Note the inverted semantics! This method is TMC2209-only.
+
+        Returns dict with 'en_spreadcycle', 'tpwmthrs', 'sgthrs',
+        'tcoolthrs' (or None values where read failed).
+        """
+        snapshot = {}
+        for field in ('en_spreadcycle', 'tpwmthrs',
+                       'sgthrs', 'tcoolthrs'):
+            try:
+                snapshot[field] = self.tmc.fields.get_field(field)
+            except (KeyError, AttributeError):
+                snapshot[field] = None
+        return snapshot
+
+    def _set_tmc_field_safe(self, field, value):
+        """SET_TMC_FIELD wrapper. Returns True on success."""
+        try:
+            self.gcode.run_script_from_command(
+                "SET_TMC_FIELD STEPPER=%s FIELD=%s VALUE=%d"
+                % (self.stepper_name, field, int(value)))
+            return True
+        except Exception as e:
+            logging.exception(
+                "tmc_flow_test: failed to set %s: %s" % (field, e))
+            return False
+
+    def _restore_tmc2209_chopper(self, snapshot, gcmd):
+        """Restore the chopper state captured by snapshot. Best-effort:
+        logs failures but tries to set every field that has a value."""
+        ok = True
+        for field in ('en_spreadcycle', 'tpwmthrs',
+                       'sgthrs', 'tcoolthrs'):
+            if snapshot.get(field) is not None:
+                if not self._set_tmc_field_safe(field, snapshot[field]):
+                    ok = False
+        if ok:
+            gcmd.respond_info(
+                "Original chopper config restored.")
+        else:
+            gcmd.respond_info(
+                "WARNING: chopper restore had failures. Run "
+                "FIRMWARE_RESTART to fully reset.")
+        return ok
+
+    def _evaluate_sg4_quality(self, low_stats, high_stats):
+        """Decide if a (low-flow, high-flow) pair of probes shows a
+        usable SG4 signal for slip detection.
+
+        IMPORTANT: SG4 on TMC2209 behaves differently from SG2. The
+        original SG2 logic (load drops SG_RESULT proportionally) does
+        NOT apply. Empirically, SG_RESULT on TMC2209:
+          - Sticks in a "bias region" (6-22) at low velocity
+          - Often INCREASES (not decreases) with load
+          - But CV (run-to-run variance) reliably EXPLODES at slip
+
+        We declare the signal USABLE if ANY of the following holds —
+        each one alone is enough evidence that downstream slip
+        detection has something to work with:
+
+          (A) CV-spike: high_cv ≥ 10 % AND CV ratio ≥ 3×
+              The CV-based triggers will fire at real slip.
+
+          (B) Range separation: P25-P75 boxes of the two probes do
+              NOT overlap. This means even single noisy samples can
+              be classified as "low-flow region" vs "high-flow region"
+              — the strongest possible evidence the signal carries
+              load information.
+
+          (C) Magnitude change: |delta| ≥ 30 SG-units. Down from the
+              previous 50 — anything ≥ 30 is well above typical
+              measurement noise (~3–5 units stddev) and gives
+              magnitude-based triggers headroom.
+
+          (D) Ratio change: high/low ratio ≥ 2× (or ≤ 0.5× inverse).
+              Catches cases where absolute delta is small but the
+              relative change is large (e.g. low=10, high=25:
+              delta=15 but ratio=2.5×).
+
+        We accept either direction of SG-median change — some TMC2209
+        hardware shows inverted behaviour (SG up at load). The
+        plugin's CV/IQR-based triggers work regardless of SG direction.
+
+        Returns dict with 'usable' (bool), 'reason' (str), 'delta'
+        (signed median difference high − low), 'cv_ratio' (high_cv /
+        low_cv).
+        """
+        if not low_stats or not high_stats:
+            return {'usable': False,
+                    'reason': 'one or both probes returned no samples',
+                    'delta': None, 'cv_ratio': None}
+
+        low_med = low_stats.get('median', 0)
+        high_med = high_stats.get('median', 0)
+        low_p25 = low_stats.get('p25', low_med)
+        low_p75 = low_stats.get('p75', low_med)
+        high_p25 = high_stats.get('p25', high_med)
+        high_p75 = high_stats.get('p75', high_med)
+        low_cv = low_stats.get('cv', 100)
+        high_cv = high_stats.get('cv', 100)
+        delta = high_med - low_med
+        # Avoid division by zero for very small CV
+        cv_ratio = high_cv / max(low_cv, 0.5)
+        # Median ratio (always in [1, ∞) by symmetric definition)
+        if low_med > 0 and high_med > 0:
+            med_ratio = max(high_med / low_med, low_med / high_med)
+        else:
+            med_ratio = 1.0
+
+        # Both probes returning zero means no signal at all
+        if low_med == 0 and high_med == 0:
+            return {'usable': False,
+                    'reason': 'SG_RESULT stuck at 0 in both probes — '
+                              'driver returns no SG signal',
+                    'delta': delta, 'cv_ratio': cv_ratio}
+
+        # Path A: CV-spike (primary slip signature on TMC2209)
+        if cv_ratio >= 3.0 and high_cv >= 10.0:
+            return {'usable': True,
+                    'reason': ('CV-spike detected: CV jumped from '
+                               '%.1f%% (low) to %.1f%% (high), %.1fx '
+                               'increase. CV-based slip triggers '
+                               'will catch real slip events.'
+                               % (low_cv, high_cv, cv_ratio)),
+                    'delta': delta, 'cv_ratio': cv_ratio}
+
+        # Path B: P25-P75 ranges of the two probes don't overlap.
+        # This is the strongest possible evidence of load sensitivity:
+        # even individual samples are classifiable as "low" vs "high".
+        ranges_separate = (low_p75 < high_p25) or (high_p75 < low_p25)
+        if ranges_separate:
+            return {'usable': True,
+                    'reason': ('clean range separation: low-flow P25-P75 '
+                               '= %d-%d, high-flow P25-P75 = %d-%d. The '
+                               'two distributions don\'t overlap — '
+                               'strong load-correlated signal.'
+                               % (low_p25, low_p75, high_p25, high_p75)),
+                    'delta': delta, 'cv_ratio': cv_ratio}
+
+        # Path C: large absolute magnitude change
+        if abs(delta) >= 30:
+            direction = ('drops' if delta < 0 else 'rises')
+            return {'usable': True,
+                    'reason': ('SG-median %s by %d units between low '
+                               'and high flow (well above noise floor). '
+                               'Signal is responsive to load (note: '
+                               'TMC2209 SG direction can be inverted '
+                               'vs. SG2 spec — this is normal).'
+                               % (direction, abs(delta))),
+                    'delta': delta, 'cv_ratio': cv_ratio}
+
+        # Path D: relative ratio change (catches small-magnitude /
+        # high-relative-change cases)
+        if med_ratio >= 2.0:
+            return {'usable': True,
+                    'reason': ('SG-median changed by %.1fx between low '
+                               'and high flow (%d → %d). Relative '
+                               'change is large enough for magnitude-'
+                               'based triggers to work.'
+                               % (med_ratio, low_med, high_med)),
+                    'delta': delta, 'cv_ratio': cv_ratio}
+
+        # Neither CV nor SG-median moved enough — signal is dead
+        if low_cv > 25 or high_cv > 25:
+            return {'usable': False,
+                    'reason': ('high noise without load-correlated '
+                               'change: CV %.1f%% / %.1f%%, SG delta '
+                               'only %d, ratio %.1fx. Pure noise, '
+                               'not signal.'
+                               % (low_cv, high_cv, delta, med_ratio)),
+                    'delta': delta, 'cv_ratio': cv_ratio}
+        return {'usable': False,
+                'reason': ('signal too flat: SG delta = %+d, ratio '
+                           '%.1fx, CV ratio %.1fx, ranges %d-%d vs '
+                           '%d-%d (overlap). Need any of: |delta|≥30, '
+                           'ratio≥2×, range separation, or CV-spike. '
+                           'Try higher HIGH_FLOW or higher run_current.'
+                           % (delta, med_ratio, cv_ratio,
+                              low_p25, low_p75, high_p25, high_p75)),
+                'delta': delta, 'cv_ratio': cv_ratio}
+
+    def cmd_TMC_FLOW_TEST_SG_VARIANTS(self, gcmd):
+        """Empirically probe whether TMC2209 SG4 produces usable
+        readings in SpreadCycle mode (in addition to the documented
+        StealthChop mode).
+
+        Test method:
+          1. Save current chopper state
+          2. Force StealthChop, probe SG at LOW_FLOW and HIGH_FLOW
+          3. Force SpreadCycle, probe SG at LOW_FLOW and HIGH_FLOW
+          4. Compare: usable signal needs (a) non-zero median, (b)
+             load-sensitive Δmedian ≥ 30, (c) run-to-run CV < 25 %
+          5. Restore original chopper state
+          6. Print verdict and recommendation
+        """
+        self._lookup_tmc()
+        if self.driver_type != 'tmc2209':
+            gcmd.respond_info(
+                "TMC_FLOW_TEST_SG_VARIANTS is only meaningful for "
+                "TMC2209 (current driver: %s). For TMC5160/TMC2240 "
+                "the plugin already runs in the optimal SG2 + "
+                "SpreadCycle mode." % self.driver_type)
+            return
+
+        low_flow = gcmd.get_float('LOW_FLOW', 5.0,
+                                   minval=1.0, maxval=30.0)
+        high_flow = gcmd.get_float('HIGH_FLOW', 20.0,
+                                    minval=5.0, maxval=150.0)
+        duration = gcmd.get_float('DURATION', 5.0,
+                                   minval=2.0, maxval=15.0)
+        repeat = gcmd.get_int('REPEAT', 5, minval=3, maxval=10)
+        sgthrs = gcmd.get_int('SGTHRS', 100, minval=0, maxval=255)
+
+        if high_flow <= low_flow:
+            raise gcmd.error(
+                "HIGH_FLOW (%.1f) must be greater than LOW_FLOW (%.1f)"
+                % (high_flow, low_flow))
+
+        # Hotend-temp safety check — same pattern as the main test
+        extruder = self.printer.lookup_object('extruder')
+        heater = extruder.get_heater()
+        cur_temp, _ = heater.get_temp(self.reactor.monotonic())
+        target_temp = heater.target_temp
+        if cur_temp < self.min_hotend_temp:
+            raise gcmd.error(
+                "Hotend too cold: %.1f °C < %.1f °C minimum"
+                % (cur_temp, self.min_hotend_temp))
+
+        gcmd.respond_info(
+            "===== TMC2209 SG_RESULT chopper-mode comparison =====\n"
+            "This test will run %d × %.1f s probes at flow=%.1f mm³/s\n"
+            "and flow=%.1f mm³/s in BOTH StealthChop and SpreadCycle.\n"
+            "It empirically determines whether SG_RESULT works in\n"
+            "SpreadCycle on YOUR specific hardware.\n"
+            "Expected runtime: ~%.0f minutes.\n"
+            "Hotend: %.1f °C / target %.1f °C\n"
+            "------------------------------------------------"
+            % (repeat, duration, low_flow, high_flow,
+               (4 * repeat * (duration + 0.5)) / 60.0,
+               cur_temp, target_temp))
+
+        # Snapshot current chopper config
+        snapshot = self._save_tmc2209_chopper_state()
+        gcmd.respond_info(
+            "Saved chopper state: en_spreadcycle=%s tpwmthrs=%s "
+            "sgthrs=%s tcoolthrs=%s"
+            % (snapshot['en_spreadcycle'], snapshot['tpwmthrs'],
+               snapshot['sgthrs'], snapshot['tcoolthrs']))
+
+        # Set extruder relative + zero
+        self.gcode.run_script_from_command("M83\nG92 E0\nM400")
+        # Ensure SGTHRS is a sane value for the test (irrelevant for
+        # SG_RESULT reads themselves, but needed if user has it at 0)
+        self._set_tmc_field_safe('sgthrs', sgthrs)
+        # TCOOLTHRS must be > 0 for SG to be active (Trinamic spec).
+        # Use 0xFFFFF (= 1048575, max 20-bit value) so SG is active
+        # at any motor velocity.
+        self._set_tmc_field_safe('tcoolthrs', 0xFFFFF)
+        # Sync to ensure the fields are committed before we proceed
+        self.gcode.run_script_from_command("M400")
+
+        results = {}
+        try:
+            # ─── Phase A: StealthChop ──────────────────────────────
+            # TMC2209 GCONF Bit 2 'en_spreadcycle':
+            #   0 = StealthChop (Trinamic default for TMC2209)
+            #   1 = SpreadCycle
+            # TPWMTHRS = 0xFFFFF means "never auto-switch to SpreadCycle
+            # at higher velocity" — we want pure StealthChop here.
+            gcmd.respond_info(">>> Phase A: StealthChop (documented)")
+            self._set_tmc_field_safe('en_spreadcycle', 0)
+            self._set_tmc_field_safe('tpwmthrs', 0xFFFFF)
+            # Settle delay + sync. Re-assert M83 + G92 E0 because some
+            # SET_TMC_FIELD operations can disturb the extruder state
+            # (or Klipper may reset it as part of the field write).
+            self.gcode.run_script_from_command(
+                "M400\nG4 P1500\nM83\nG92 E0\nM400")
+
+            gcmd.respond_info(
+                "  StealthChop: low-flow probe at %.1f mm³/s..." % low_flow)
+            sc_low = self._probe_sg_at_flow(
+                gcmd, low_flow, duration, repeat, skip_warmup=False)
+            # Reset extruder state between probes too — the rep-loop
+            # in _measure_step relies on M83 still being active.
+            self.gcode.run_script_from_command(
+                "M400\nG4 P2000\nM83\nG92 E0\nM400")
+            gcmd.respond_info(
+                "  StealthChop: high-flow probe at %.1f mm³/s..." % high_flow)
+            sc_high = self._probe_sg_at_flow(
+                gcmd, high_flow, duration, repeat, skip_warmup=False)
+
+            results['stealthchop'] = {
+                'low': sc_low, 'high': sc_high,
+                'eval': self._evaluate_sg4_quality(sc_low, sc_high),
+            }
+            # Inter-phase rest
+            self.gcode.run_script_from_command(
+                "M400\nG4 P3000\nM83\nG92 E0\nM400")
+
+            # ─── Phase B: SpreadCycle ──────────────────────────────
+            # Force SpreadCycle by setting en_spreadcycle=1.
+            # TPWMTHRS irrelevant when en_spreadcycle=1 since GCONF
+            # already forces SpreadCycle.
+            gcmd.respond_info(">>> Phase B: SpreadCycle (experimental)")
+            self._set_tmc_field_safe('en_spreadcycle', 1)
+            self._set_tmc_field_safe('tpwmthrs', 0)
+            self.gcode.run_script_from_command(
+                "M400\nG4 P1500\nM83\nG92 E0\nM400")
+
+            gcmd.respond_info(
+                "  SpreadCycle: low-flow probe at %.1f mm³/s..." % low_flow)
+            sp_low = self._probe_sg_at_flow(
+                gcmd, low_flow, duration, repeat, skip_warmup=False)
+            self.gcode.run_script_from_command(
+                "M400\nG4 P2000\nM83\nG92 E0\nM400")
+            gcmd.respond_info(
+                "  SpreadCycle: high-flow probe at %.1f mm³/s..." % high_flow)
+            sp_high = self._probe_sg_at_flow(
+                gcmd, high_flow, duration, repeat, skip_warmup=False)
+
+            results['spreadcycle'] = {
+                'low': sp_low, 'high': sp_high,
+                'eval': self._evaluate_sg4_quality(sp_low, sp_high),
+            }
+        finally:
+            # ─── Always restore original chopper state ─────────────
+            self._restore_tmc2209_chopper(snapshot, gcmd)
+
+        # ─── Report ────────────────────────────────────────────────
+        def fmt_probe(p):
+            if not p or p.get('median') is None:
+                return "no samples"
+            return ("median=%.0f, p25=%.0f, p75=%.0f, min=%.0f, max=%.0f, "
+                    "CV=%.1f%%"
+                    % (p.get('median', 0), p.get('p25', 0),
+                       p.get('p75', 0), p.get('min', 0),
+                       p.get('max', 0), p.get('cv', 0)))
+
+        gcmd.respond_info(
+            "================================================\n"
+            "===== Results =====")
+
+        for mode_name, mode_label in [('stealthchop', 'StealthChop'),
+                                      ('spreadcycle', 'SpreadCycle')]:
+            data = results.get(mode_name, {})
+            ev = data.get('eval', {})
+            usable = ev.get('usable', False)
+            verdict = "✓ USABLE" if usable else "✗ NOT USABLE"
+            gcmd.respond_info(
+                "%s: %s\n"
+                "  flow=%.1f mm³/s: %s\n"
+                "  flow=%.1f mm³/s: %s\n"
+                "  → %s"
+                % (mode_label, verdict, low_flow,
+                   fmt_probe(data.get('low')),
+                   high_flow,
+                   fmt_probe(data.get('high')),
+                   ev.get('reason', 'no evaluation')))
+
+        # ─── Recommendation ────────────────────────────────────────
+        sc_eval = results['stealthchop']['eval']
+        sp_eval = results['spreadcycle']['eval']
+        sc_ok = sc_eval.get('usable', False)
+        sp_ok = sp_eval.get('usable', False)
+
+        gcmd.respond_info("===== Recommendation =====")
+        if sc_ok and sp_ok:
+            sc_cvr = sc_eval.get('cv_ratio') or 0
+            sp_cvr = sp_eval.get('cv_ratio') or 0
+            # Both work — pick the one with cleaner slip signature
+            if sp_cvr > sc_cvr * 1.2:
+                gcmd.respond_info(
+                    "✓ Both StealthChop AND SpreadCycle produce a\n"
+                    "  usable slip signal on YOUR hardware.\n"
+                    "  SpreadCycle has stronger CV-spike at slip\n"
+                    "  (CV ratio %.1fx vs %.1fx in StealthChop).\n"
+                    "  → SpreadCycle gives full motor torque AND a\n"
+                    "    detectable slip signal — use it for max flow:\n"
+                    "      stealthchop_threshold: 0\n"
+                    "      driver_SGTHRS: %d\n"
+                    "  → Run TMC_FLOW_FIND_MAX MAX=150 START=30\n"
+                    "  → CAUTION: SG4 in SpreadCycle is unsupported by\n"
+                    "    Trinamic spec. Validate with several long\n"
+                    "    prints before trusting the slicer value."
+                    % (sp_cvr, sc_cvr, sgthrs))
+            else:
+                gcmd.respond_info(
+                    "✓ Both StealthChop AND SpreadCycle produce a\n"
+                    "  usable slip signal on YOUR hardware.\n"
+                    "  StealthChop has stronger or similar CV-spike\n"
+                    "  (CV ratio %.1fx vs %.1fx).\n"
+                    "  → Use the documented StealthChop mode:\n"
+                    "      stealthchop_threshold: 999999\n"
+                    "      driver_SGTHRS: %d\n"
+                    "  → Run TMC_FLOW_FIND_MAX MAX=150 START=30"
+                    % (sc_cvr, sp_cvr, sgthrs))
+        elif sc_ok:
+            gcmd.respond_info(
+                "✓ StealthChop produces a usable slip signal on\n"
+                "  YOUR hardware (CV ratio %.1fx between low/high flow).\n"
+                "✗ SpreadCycle did not show a clean slip signature.\n"
+                "  → Use the documented StealthChop config:\n"
+                "      stealthchop_threshold: 999999\n"
+                "      driver_SGTHRS: %d\n"
+                "  → Run TMC_FLOW_FIND_MAX MAX=150 START=30\n"
+                "    (START=30 because TMC2209 SG4 has a low-velocity\n"
+                "    bias region — start above it for clean readings)"
+                % (sc_eval.get('cv_ratio') or 0, sgthrs))
+        elif sp_ok:
+            gcmd.respond_info(
+                "✓ SpreadCycle produces a usable slip signal on YOUR\n"
+                "  hardware (CV ratio %.1fx between low/high flow).\n"
+                "✗ StealthChop did not show a clean slip signature.\n"
+                "  → This is unusual but the test confirms SpreadCycle\n"
+                "    works for slip detection here.\n"
+                "  → Force SpreadCycle in your config:\n"
+                "      stealthchop_threshold: 0\n"
+                "      driver_SGTHRS: %d\n"
+                "  → Run TMC_FLOW_FIND_MAX MAX=150 START=30\n"
+                "  → CAUTION: SG4 in SpreadCycle is unsupported per\n"
+                "    Trinamic spec. Validate before relying on result."
+                % (sp_eval.get('cv_ratio') or 0, sgthrs))
+        else:
+            gcmd.respond_info(
+                "✗ Neither chopper mode produced a usable slip signal\n"
+                "  on this hardware combination.\n"
+                "  Diagnostics to try:\n"
+                "  1. Was the motor actually slipping at HIGH_FLOW?\n"
+                "     If not, increase HIGH_FLOW (try 150) so the\n"
+                "     test reaches actual stall.\n"
+                "  2. Increase run_current (e.g. 1.0 A) for more\n"
+                "     load differentiation.\n"
+                "  3. Check with DUMP_TMC STEPPER=extruder during a\n"
+                "     long G1 E... command — does SG_RESULT change?\n"
+                "  4. If SG_RESULT stays at 0 or one fixed value:\n"
+                "     hardware-side SG4 problem (some TMC2209 clones\n"
+                "     have non-functional SG4). Try a different\n"
+                "     TMC2209 board, or switch to TMC2240.")
+
+    # ─── Main commands ──────────────────────────────────────────────
+
+    def cmd_TMC_FLOW_FIND_MAX(self, gcmd):
+        """Run the StallGuard-based flow test."""
+        self._lookup_tmc()
+        self._run_find_max(gcmd)
+
+    def _run_find_max(self, gcmd):
+        """Common bracket-bisection algorithm using SG triggers."""
+        self._lookup_tmc()
+
+        start_flow = gcmd.get_float('START', 10.0, above=0.)
+        max_flow = gcmd.get_float('MAX', 80.0, above=start_flow)
+        coarse_step = gcmd.get_float('COARSE_STEP', 10.0, above=0.)
+        min_step = gcmd.get_float('MIN_STEP', 1.0, above=0.)
+        step_duration = gcmd.get_float('DURATION', 5.0, above=0.5)
+        repeat = gcmd.get_int('REPEAT', 5, minval=1, maxval=10)
+        verify_repeats = gcmd.get_int(
+            'VERIFY_REPEATS', 5, minval=1, maxval=10)
+        purge = gcmd.get_float('PURGE', 0.0, minval=0.)
+        cooldown = gcmd.get_float('COOLDOWN', 15.0, minval=0., maxval=300.)
+        max_bisect = gcmd.get_int(
+            'MAX_BISECT_STEPS', 6, minval=2, maxval=15)
+        no_html = gcmd.get_int('NO_HTML', 0, minval=0, maxval=1)
+        skip_check = gcmd.get_int(
+            'SKIP_TMC_CHECK', 0, minval=0, maxval=1)
+        auto_sgt = gcmd.get_int('AUTO_SGT', 1, minval=0, maxval=1)
+        keep_sgt = gcmd.get_int('KEEP_SGT', 0, minval=0, maxval=1)
+        cold_extrusion_hint = gcmd.get_float(
+            'COLD_EXTRUSION_HINT', 0.0, minval=0., maxval=200.)
+
+        if min_step >= coarse_step:
+            raise gcmd.error(
+                "MIN_STEP (%.1f) must be smaller than COARSE_STEP (%.1f)"
+                % (min_step, coarse_step))
+
+        # ─── TMC config check ───
+        if not skip_check:
+            problems, infos = self._check_tmc_config()
+            if problems:
+                msg = "\n=== TMC Configuration Issue(s) ===\n"
+                for fname, val, desc in problems:
+                    msg += "Problem: %s (current value: %s)\n%s\n\n" % (
+                        fname, val, desc)
+                msg += ("After updating printer.cfg, run:\n"
+                        "  FIRMWARE_RESTART\n"
+                        "  TMC_FLOW_FIND_MAX\n\n"
+                        "To skip this check (advanced):\n"
+                        "  TMC_FLOW_FIND_MAX SKIP_TMC_CHECK=1")
+                raise gcmd.error(msg)
+            gcmd.respond_info("TMC configuration check passed.")
+            for info in infos:
+                gcmd.respond_info(info)
+
+        # ─── Hotend temp check ───
+        extruder = self.printer.lookup_object('extruder')
+        heater = extruder.get_heater()
+        cur_temp, _ = heater.get_temp(self.reactor.monotonic())
+        target_temp = heater.target_temp
+        if cur_temp < self.min_hotend_temp:
+            raise gcmd.error(
+                "Hotend too cold: %.1f°C (min %.1f°C)."
+                % (cur_temp, self.min_hotend_temp))
+        if target_temp > 0 and cur_temp < target_temp - 5.0:
+            raise gcmd.error(
+                "Hotend not at target: %.1f°C (target %.1f°C). "
+                "Wait for M109 or run M109 S%d before testing."
+                % (cur_temp, target_temp, int(target_temp)))
+
+        # ─── Auto-SGT tuning ───
+        # Optional pre-test step that probes SG_RESULT at low flow
+        # and adjusts SGT to land in the profile's healthy target
+        # range. Set AUTO_SGT=0 to skip. By default the original
+        # SGT is RESTORED after the test so printer.cfg behavior
+        # doesn't silently change; pass KEEP_SGT=1 to leave the
+        # tuned value active until the next FIRMWARE_RESTART.
+        #
+        # IMPORTANT: _measure_step issues `G1 E<value>` commands which
+        # are interpreted in the current extruder mode. The main test
+        # (further below) sets `M83\nG92 E0` (relative + reset)
+        # before the coarse loop, but auto-SGT runs BEFORE that block,
+        # so we set the same mode here. Without this, only the first
+        # repetition extrudes anything — subsequent reps see "G1 E5"
+        # as "go TO position 5" and the extruder is already there.
+        original_sgt = None
+        final_sgt = None
+        if auto_sgt and self._can_autotune_sgt():
+            self.gcode.run_script_from_command("M83\nG92 E0")
+            original_sgt, final_sgt = self._autotune_sgt(gcmd, start_flow)
+
+        rotation_distance = self._get_rotation_distance(extruder)
+        if rotation_distance is None:
+            raise gcmd.error("Could not determine rotation_distance")
+
+        timestamp = time.strftime('%Y-%m-%d_%H-%M-%S')
+        sg_label = self._get_sg_label()
+        meta = {
+            'timestamp': timestamp,
+            'driver': '%s on %s (%s register, sample rate %.0f Hz)' % (
+                self.driver_type, self.stepper_name, sg_label,
+                1.0 / SAMPLE_INTERVAL),
+            'algorithm': 'ADAPTIVE BISECTION (coarse=%.1f, min=%.1f, '
+                         'repeats=%d)' % (coarse_step, min_step, repeat),
+            'hotend_temp': '%.1f °C (target %.1f °C)' % (
+                cur_temp, target_temp),
+            'filament_diameter': '%.2f mm' % self.filament_diameter,
+            'melt_zone_length': '%.1f mm' % self.melt_zone_length,
+            'rotation_distance': '%.4f mm' % rotation_distance,
+            'flow_range': '%.1f → %.1f mm³/s (adaptive)' % (
+                start_flow, max_flow),
+            'step_duration': '%.1f s' % step_duration,
+            'cold_extrusion_hint': cold_extrusion_hint,
+            'tmc_settings': self._snapshot_tmc_settings(),
+        }
+
+        # ─── Banner ───
+        gcmd.respond_info(
+            "===== TMC Flow Test v%s =====\n"
+            "Range: %.0f → %.0f mm³/s | Coarse: %.0f | Min: %.0f mm³/s\n"
+            "Each measurement: %d reps × %.1f s (median over all samples)\n"
+            "Cool-down between phases: %.0f s | Hotend: %.1f°C "
+            "(target %.1f°C)\n"
+            "Sample rate: %.0f Hz | Driver: %s | Register: %s\n"
+            "------------------------------------------------\n"
+            "Algorithm:\n"
+            "  Phase 1 (Coarse): increase flow in big steps until trigger\n"
+            "  Phase 2 (Bisection): narrow to ±%.0f mm³/s by halving\n"
+            "  Phase 3 (Verification): confirm with %d reps\n"
+            "================================================"
+            % (MODULE_VERSION,
+               start_flow, max_flow, coarse_step, min_step,
+               repeat, step_duration, cooldown,
+               cur_temp, target_temp,
+               1.0 / SAMPLE_INTERVAL, self.driver_type, sg_label,
+               min_step, verify_repeats))
+
+        if cold_extrusion_hint > 0:
+            gcmd.respond_info(
+                "Cold-extrusion hint: %.1f mm³/s — will be marked as "
+                "a vertical line in the HTML report. The plugin's slip "
+                "detection ignores this value; it's purely informational."
+                % cold_extrusion_hint)
+
+        if purge > 0:
+            self.gcode.run_script_from_command(
+                "M83\nG1 E%.2f F300\nG92 E0" % purge)
+        self.gcode.run_script_from_command("M83\nG92 E0")
+
+        results = []
+
+        def measure_and_save(flow, phase):
+            r = self._measure_step(
+                gcmd, flow, step_duration, repeat)
+            r['phase'] = phase
+            results.append(r)
+            self._save_report(
+                results, meta, timestamp, None, no_html,
+                gcmd=None, announce=False)
+            return r
+
+        def check(results):
+            """SG-based slip detection."""
+            return self._check_triggers_sg(results)
+
+        # ─── PHASE 1: Coarse ───
+        gcmd.respond_info(
+            "\n>>> Phase 1: Coarse Upward Sweep <<<\n"
+            "  Stepping up by %.0f mm³/s. Each step: %d reps × %.1f s."
+            % (coarse_step, repeat, step_duration))
+
+        flow = start_flow
+        low = None
+        high = None
+        first_trigger_reason = None
+        # Track every trigger / borderline / verify-fail event for the
+        # HTML "decision trail" panel. Each entry: dict with keys
+        # 'phase', 'flow', 'kind' (one of: 'trigger', 'borderline-retest',
+        # 'borderline-confirmed', 'verify-fail', 'verify-borderline'),
+        # 'reason', 'cv', 'iqr', 'sg_median'.
+        trigger_events = []
+
+        def _record_event(phase, flow, kind, reason, last_result=None):
+            ev = {'phase': phase, 'flow': flow,
+                  'kind': kind, 'reason': reason,
+                  'cv': None, 'iqr': None, 'sg_median': None}
+            if last_result is not None:
+                rc = last_result.get('run_consistency') or {}
+                ev['cv'] = rc.get('sg_cv')
+                sg = last_result.get('sg') or {}
+                if 'p25' in sg and 'p75' in sg:
+                    ev['iqr'] = sg['p75'] - sg['p25']
+                if 'median' in sg:
+                    ev['sg_median'] = sg['median']
+            trigger_events.append(ev)
+
+        while flow <= max_flow + 0.001:
+            r = measure_and_save(flow, 'coarse')
+
+            reason = check(results)
+            if reason:
+                high = flow
+                low = flow - coarse_step
+                first_trigger_reason = reason
+                _record_event('coarse', flow, 'trigger', reason,
+                              results[-1] if results else None)
+                gcmd.respond_info(
+                    "  >>> TRIGGER at %.1f mm³/s — %s\n"
+                    "      → Safe range narrowed to [%.1f, %.1f] mm³/s"
+                    % (flow, reason, low, high))
+                break
+
+            low = flow
+            self.gcode.run_script_from_command("G4 P500")
+            flow += coarse_step
+
+        if high is None:
+            gcmd.respond_info(
+                "Reached MAX %.1f mm³/s without trigger. Try MAX higher."
+                % max_flow)
+            self._save_report(results, meta, timestamp, None,
+                              no_html, gcmd=gcmd)
+            self._restore_sgt_if_needed(gcmd, original_sgt, final_sgt,
+                                         keep_sgt)
+            return
+
+        if low < start_flow:
+            gcmd.respond_info(
+                "Trigger fired on first step (%.1f) — lower START." % high)
+            self._save_report(results, meta, timestamp, first_trigger_reason,
+                              no_html, gcmd=gcmd)
+            self._restore_sgt_if_needed(gcmd, original_sgt, final_sgt,
+                                         keep_sgt)
+            return
+
+        # ─── PHASES 2 + 3: Bisection + Verify (with retry) ───
+        # Phase 2 narrows the bracket; Phase 3 confirms the result. If
+        # Phase 3 fails (verify itself trips a trigger or stays
+        # borderline on re-test), we drop back into Phase 2 with a
+        # tightened high bound and try again. Up to MAX_VERIFY_FAILURES
+        # rounds before giving up — without this cap a hardware /
+        # filament issue could loop forever.
+        MAX_VERIFY_FAILURES = 3
+
+        # Track which flows we've already re-tested in bisection (set
+        # is reset on each bisection re-entry to allow fresh re-tests
+        # at the new bracket).
+        last_trigger_reason = first_trigger_reason
+        verify_failures = 0
+        verify_result = None
+        verify_cv = 0.0
+
+        while True:
+            # ─── PHASE 2: Bisection ───
+            if cooldown > 0:
+                gcmd.respond_info(
+                    "  ... Cool-down: %.0f s ..." % cooldown)
+                self.gcode.run_script_from_command(
+                    "G4 P%d" % int(cooldown * 1000))
+
+            phase2_label = (("\n>>> Phase 2: Bisection (retry %d) <<<"
+                             % verify_failures)
+                            if verify_failures > 0
+                            else "\n>>> Phase 2: Bisection <<<")
+            gcmd.respond_info(
+                "%s\n"
+                "  Narrowing [%.0f, %.0f] by halving until interval ≤ %.0f. "
+                "Up to %d steps.\n"
+                "  Borderline measurements (CV 4-7%% or IQR 15-24) are "
+                "re-tested once for confirmation."
+                % (phase2_label, low, high, min_step, max_bisect))
+
+            bisect_iter = 0
+            retested_flows = set()
+            while ((high - low) > min_step + 0.001
+                   and bisect_iter < max_bisect):
+                bisect_iter += 1
+                raw_mid = (low + high) / 2.0
+                mid = round(raw_mid / min_step) * min_step
+                if mid <= low + 0.001 or mid >= high - 0.001:
+                    break
+
+                r = measure_and_save(mid, 'bisect')
+                reason = check(results)
+
+                # Borderline check: if no clear trigger fired but the
+                # data sits in the gray zone, re-measure once before
+                # classifying.
+                if (reason is None
+                        and mid not in retested_flows):
+                    borderline_why = self._is_borderline(results)
+                    if borderline_why:
+                        retested_flows.add(mid)
+                        _record_event('bisect', mid, 'borderline-retest',
+                                      borderline_why,
+                                      results[-1] if results else None)
+                        gcmd.respond_info(
+                            "  >>> %.1f mm³/s BORDERLINE — %s\n"
+                            "      Re-measuring once for confirmation..."
+                            % (mid, borderline_why))
+                        if cooldown > 0:
+                            self.gcode.run_script_from_command(
+                                "G4 P%d" % int(cooldown * 1000))
+                        # Drop the borderline measurement and replace
+                        # with the fresh one.
+                        results.pop()
+                        r2 = measure_and_save(mid, 'bisect')
+                        reason = check(results)
+                        if reason is None:
+                            re_borderline = self._is_borderline(results)
+                            if re_borderline:
+                                reason = ("borderline confirmed on re-"
+                                          "test: " + re_borderline)
+                                _record_event(
+                                    'bisect', mid, 'borderline-confirmed',
+                                    re_borderline,
+                                    results[-1] if results else None)
+
+                if reason:
+                    high = mid
+                    last_trigger_reason = reason
+                    # Avoid double-recording if borderline-confirmed
+                    # already recorded above.
+                    if not (trigger_events
+                            and trigger_events[-1].get('flow') == mid
+                            and trigger_events[-1].get('kind')
+                            == 'borderline-confirmed'):
+                        _record_event('bisect', mid, 'trigger', reason,
+                                      results[-1] if results else None)
+                    gcmd.respond_info(
+                        "  >>> TRIGGER at %.1f — %s\n"
+                        "      → [%.1f, %.1f] (%d/%d)"
+                        % (mid, reason, low, high,
+                           bisect_iter, max_bisect))
+                else:
+                    low = mid
+                    gcmd.respond_info(
+                        "  >>> %.1f mm³/s SAFE → [%.1f, %.1f] (%d/%d)"
+                        % (mid, low, high, bisect_iter, max_bisect))
+                self.gcode.run_script_from_command("G4 P500")
+
+            # ─── PHASE 3: Verify ───
+            if cooldown > 0:
+                gcmd.respond_info(
+                    "  ... Cool-down before verification: %.0f s ..."
+                    % cooldown)
+                self.gcode.run_script_from_command(
+                    "G4 P%d" % int(cooldown * 1000))
+
+            gcmd.respond_info(
+                "\n>>> Phase 3: Verification at %.1f mm³/s <<<\n"
+                "  Confirming with %d repetitions."
+                % (low, verify_repeats))
+            verify_result = self._measure_step(
+                gcmd, low, step_duration, verify_repeats,
+                )
+            verify_result['phase'] = 'verify'
+            results.append(verify_result)
+
+            # Check verify result against triggers and borderline.
+            verify_trigger = check(results)
+            if verify_trigger is None:
+                verify_borderline = self._is_borderline(results)
+                if verify_borderline:
+                    # Re-measure verify once at the same flow before
+                    # accepting; if it stays borderline, treat as fail.
+                    _record_event('verify', low, 'verify-borderline',
+                                  verify_borderline,
+                                  results[-1] if results else None)
+                    gcmd.respond_info(
+                        "  >>> Verify at %.1f BORDERLINE — %s\n"
+                        "      Re-measuring once for confirmation..."
+                        % (low, verify_borderline))
+                    if cooldown > 0:
+                        self.gcode.run_script_from_command(
+                            "G4 P%d" % int(cooldown * 1000))
+                    results.pop()
+                    verify_result = self._measure_step(
+                        gcmd, low, step_duration, verify_repeats,
+                        )
+                    verify_result['phase'] = 'verify'
+                    results.append(verify_result)
+                    verify_trigger = check(results)
+                    if verify_trigger is None:
+                        re_borderline = self._is_borderline(results)
+                        if re_borderline:
+                            verify_trigger = ("borderline confirmed on "
+                                              "re-test: "
+                                              + re_borderline)
+
+            if verify_trigger is None:
+                # Verify clean — accept the result.
+                break
+
+            # Verify FAILED. Drop back into bisection with a tighter
+            # high bound (the just-failed flow becomes the new high).
+            verify_failures += 1
+            _record_event('verify', low, 'verify-fail', verify_trigger,
+                          results[-1] if results else None)
+            verify_cv_now = (verify_result.get('run_consistency', {})
+                             .get('sg_cv', 0.0))
+            gcmd.respond_info(
+                "\n  >>> ⚠ VERIFY FAILED at %.1f mm³/s "
+                "(CV %.1f%%, attempt %d/%d)\n"
+                "      Reason: %s"
+                % (low, verify_cv_now, verify_failures,
+                   MAX_VERIFY_FAILURES, verify_trigger))
+
+            if verify_failures >= MAX_VERIFY_FAILURES:
+                # Give up gracefully — report the next-lower safe step
+                # we have evidence for. Search results history for the
+                # last bisect/coarse step at flow < low that did NOT
+                # trigger.
+                fallback = None
+                for r in reversed(results[:-1]):  # skip the failed verify
+                    if r.get('phase') in ('coarse', 'bisect'):
+                        if r['flow'] < low - 0.001:
+                            fallback = r['flow']
+                            break
+                if fallback is None:
+                    fallback = max(start_flow, low - min_step)
+                gcmd.respond_info(
+                    "  Maximum verify retries reached — falling back "
+                    "to last known-good flow %.1f mm³/s." % fallback)
+                low = fallback
+                last_trigger_reason = verify_trigger
+                # Do one final verify at the fallback to populate the
+                # final verify_result with this lower value.
+                if cooldown > 0:
+                    self.gcode.run_script_from_command(
+                        "G4 P%d" % int(cooldown * 1000))
+                gcmd.respond_info(
+                    "\n>>> Phase 3: Final verification at %.1f mm³/s "
+                    "<<<\n  Confirming with %d repetitions."
+                    % (low, verify_repeats))
+                verify_result = self._measure_step(
+                    gcmd, low, step_duration, verify_repeats,
+                    )
+                verify_result['phase'] = 'verify'
+                results.append(verify_result)
+                break
+
+            # Tighten bracket: failed flow becomes new high.
+            high = low
+            # Drop low to the previous safe step we have data for, or
+            # one min_step below if no earlier safe step exists.
+            new_low = None
+            for r in reversed(results[:-1]):  # skip failed verify
+                if r.get('phase') in ('coarse', 'bisect'):
+                    if r['flow'] < high - 0.001:
+                        # Was this flow a safe one?  Check it didn't
+                        # carry a trigger.
+                        # (Heuristic: if the flow appears as a
+                        # 'safe' entry — i.e. CV < 4% AND not
+                        # borderline by current standards — accept
+                        # it as the new low.)
+                        rc = r.get('run_consistency') or {}
+                        cv = rc.get('sg_cv', 99.0)
+                        sgp = r.get('sg') or {}
+                        iqr = (sgp.get('p75', 0) - sgp.get('p25', 0)
+                               if 'p25' in sgp and 'p75' in sgp else 99)
+                        if cv < 4.0 and iqr < 15:
+                            new_low = r['flow']
+                            break
+            if new_low is None:
+                new_low = max(start_flow, high - 2 * min_step)
+            low = new_low
+            last_trigger_reason = verify_trigger
+            gcmd.respond_info(
+                "      → Re-entering bisection with bracket "
+                "[%.1f, %.1f]" % (low, high))
+
+            # Sanity: bracket too tight to bisect → just accept low.
+            if (high - low) <= min_step + 0.001:
+                gcmd.respond_info(
+                    "      Bracket already tight, "
+                    "accepting %.1f as final." % low)
+                # Do one more verify at this low to capture the final
+                # measurement metadata.
+                if cooldown > 0:
+                    self.gcode.run_script_from_command(
+                        "G4 P%d" % int(cooldown * 1000))
+                gcmd.respond_info(
+                    "\n>>> Phase 3: Final verification at %.1f mm³/s "
+                    "<<<\n  Confirming with %d repetitions."
+                    % (low, verify_repeats))
+                verify_result = self._measure_step(
+                    gcmd, low, step_duration, verify_repeats,
+                    )
+                verify_result['phase'] = 'verify'
+                results.append(verify_result)
+                break
+
+        verify_cv = (verify_result.get('run_consistency', {}).get('sg_cv', 0)
+                     if verify_result.get('run_consistency') else 0)
+
+        max_safe = low
+        if verify_cv < 5:
+            quality = "excellent (very stable)"
+        elif verify_cv < 10:
+            quality = "good (stable)"
+        elif verify_cv < 20:
+            quality = "acceptable (some variation)"
+        else:
+            quality = "poor (high variation — re-run advised)"
+
+        gcmd.respond_info(
+            "\n========== FINAL RESULT ==========\n"
+            "Maximum safe volumetric flow: %.1f mm³/s\n"
+            "Verification quality: %s (CV = %.1f%%)\n"
+            "----------------------------------\n"
+            "Slicer recommendation:\n"
+            "  Conservative (80%%): %.1f mm³/s   ← recommended\n"
+            "  Aggressive (90%%):   %.1f mm³/s   ← only with margin\n"
+            "----------------------------------\n"
+            "Detailed data: see CSV/HTML report\n"
+            "=================================="
+            % (max_safe, quality, verify_cv,
+               max_safe * 0.8, max_safe * 0.9))
+
+        self._save_report(results, meta, timestamp, last_trigger_reason,
+                          no_html, gcmd=gcmd,
+                          final_result={
+                              'max_safe': max_safe,
+                              'verify_cv': verify_cv,
+                              'quality': quality,
+                              'stop_reason': last_trigger_reason,
+                              'trigger_events': trigger_events,
+                              'baseline_stats':
+                                  self._coarse_baseline_stats(results),
+                          })
+        self.gcode.run_script_from_command("G92 E0")
+
+        # Restore SGT (unless KEEP_SGT=1)
+        self._restore_sgt_if_needed(gcmd, original_sgt, final_sgt,
+                                     keep_sgt)
+
+
+def load_config(config):
+    return TMCFlowTest(config)
