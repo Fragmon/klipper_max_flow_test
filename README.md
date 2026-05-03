@@ -553,35 +553,6 @@ tmc_flow_YYYY-MM-DD_HH-MM-SS.csv     ← raw data, 23 columns
 tmc_flow_YYYY-MM-DD_HH-MM-SS.html    ← interactive dashboard report
 ```
 
-### HTML report structure
-
-The v3.1 report is a complete dashboard rewrite with:
-
-- **Hero panel** — big result number (max safe flow) with 80 % / 90 % slicer recommendations and a status pill
-- **Insight cards** — 4 colour-coded summaries: result quality, first trigger, thermal watch (with stress-score state), driver config
-- **Tabbed charts**:
-  - **StallGuard signal** — median + P25–P75 band + average, with phase markers, trigger annotations, and three-zone background colouring (green / yellow / red)
-  - **Thermal profile** — heater PWM, hotend temperature, residence time per step, with V6 / Volcano / CHT reference lines
-  - **Run-to-run variance** — CV bar chart per step, coloured by severity vs the trigger threshold
-- **Decision timeline** — phase-by-phase summary of why the result was chosen (coarse sweep → trigger → bisect → verify)
-- **Test details** (collapsible) — full data table, test configuration, TMC settings snapshot, decision trail with trigger metrics
-- **Reference** (collapsible) — glossary explaining all metrics in plain language
-
-### CSV columns
-
-23 columns total. Slip detection columns (sg_median, sg_p25, sg_p75, sg_run_cv_pct, run_sg_avgs) plus thermal telemetry:
-
-```
-phase, flow_mm3s, sg_median, sg_p25, sg_p75, sg_avg, sg_min, sg_max, sg_n,
-n_repeats, sg_run_cv_pct, run_sg_avgs,
-temp_target, temp_start, temp_end, temp_min, temp_avg, temp_drop,
-pwm_min, pwm_max, pwm_avg, tmc_otpw, tmc_ot
-```
-
-The CSV header includes the same TMC settings block as the HTML for paper-trail purposes.
-
----
-
 ## Troubleshooting
 
 **`Section 'tmc_flow_test' is not a valid config section`** —
