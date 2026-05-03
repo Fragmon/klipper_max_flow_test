@@ -23,10 +23,10 @@ Plugin by **Steven (Fragmon) — Crydteam**
   - [How the test works](#how-the-test-works)
   - [Supported drivers](#supported-drivers)
 - [Installation](#installation)
-  - [Step 1 — Clone and install](#step-1--clone-and-install)
-  - [Step 2 — Add the Moonraker update-manager block](#step-2--add-the-moonraker-update-manager-block)
-  - [Step 3 — Verify](#step-3--verify)
+  - [One-liner install](#one-liner-install)
+  - [Verify](#verify)
   - [Updating later](#updating-later)
+  - [Custom install paths](#custom-install-paths)
   - [Compatibility](#compatibility)
 - [Configuration](#configuration)
   - [TMC driver section](#tmc-driver-section)
@@ -104,58 +104,49 @@ A complete test typically takes **10–13 minutes**.
 
 The plugin installs as a **symlink** from a cloned repo into Klipper's extras directory. This is intentional: writing a real file into `klipper/klippy/extras/` causes Moonraker / KIAUH / git to flag the Klipper repo as *dirty* or *corrupt* on its next refresh. With a symlink, the actual plugin file lives outside the Klipper repo and Klipper just follows the link.
 
-## Step 1 — Clone and install
+## One-liner install
 
 ```bash
 cd ~
 git clone https://github.com/Fragmon/klipper_max_flow_test.git
 cd klipper_max_flow_test
 bash install.sh
-sudo systemctl restart klipper
 ```
 
-> **Why `bash install.sh` and not `./install.sh`?** When uploads transit through GitHub's Web-UI or some non-Git tools, the executable bit on shell scripts can get stripped. Calling the script via `bash` avoids that. The script will set its own execute bit on first run, so subsequent runs (e.g. after `git pull`) can use `./install.sh` directly.
+That's it. The script handles everything end-to-end:
 
-The install script:
-- validates the Python file syntax before doing anything
-- creates a **symbolic link** `~/klipper/klippy/extras/tmc_flow_test.py` → `~/klipper_max_flow_test/tmc_flow_test.py`
-- clears stale Python caches
-- prints the moonraker.conf snippet for the next step
+1. **Pre-flight checks** — refuses to run as root, verifies Python 3 and the Klipper service are present
+2. **Validates Python syntax** of the plugin file before touching anything (catches corrupted downloads)
+3. **Creates a symlink** `~/klipper/klippy/extras/tmc_flow_test.py` → `~/klipper_max_flow_test/tmc_flow_test.py`
+4. **Clears stale Python caches** in `klipper/klippy/extras/__pycache__/`
+5. **Auto-registers with Moonraker's update manager** — appends an `[update_manager Crydteam-Tuning-Plugins]` block to `moonraker.conf` if it isn't already there
+6. **Restarts Klipper** (and Moonraker, if installed)
 
-> ⚠️ `FIRMWARE_RESTART` is **not** enough — the Python plugin only reloads on Klipper service restart. The install script does not restart Klipper for you.
+After the script finishes, the plugin will appear in your Mainsail / Fluidd update manager panel automatically.
 
-If the install script detects a *real* file (not a symlink) at the target path from a previous manual install, it backs it up to `tmc_flow_test.py.bak` and replaces it with the symlink — so it's safe to re-run on existing installs.
+> **Why `bash install.sh` and not `./install.sh`?** When uploads transit through GitHub's Web-UI or non-Git tools, the executable bit on shell scripts can get stripped. Calling the script via `bash` avoids that. The script sets its own execute bit on first run, so subsequent runs (e.g. after `git pull`) can use `./install.sh` directly.
 
-## Step 2 — Add the Moonraker update-manager block
+### Re-running the install script
 
-Open your `~/printer_data/config/moonraker.conf` (or `~/klipper_config/moonraker.conf` on older installs) and add:
+Re-running is safe — the script is **idempotent**:
+- existing symlinks get refreshed (no duplicates)
+- a real file (not symlink) gets backed up to `*.bak.<timestamp>` before being replaced
+- the moonraker.conf block is added only if it isn't present already
 
-```ini
-[update_manager Crydteam-Tuning-Plugins]
-type: git_repo
-primary_branch: main
-path: ~/klipper_max_flow_test
-origin: https://github.com/Fragmon/klipper_max_flow_test.git
-managed_services: klipper
+If you previously installed manually with `wget`, just re-run `bash install.sh` — the script detects the legacy file and replaces it with a symlink cleanly.
+
+## Verify
+
+After install, verify in your printer console:
+```
+TMC_FLOW_STATUS
 ```
 
-Then restart Moonraker:
-```bash
-sudo systemctl restart moonraker
-```
-
-## Step 3 — Verify
-
-The plugin should now appear in your UI's update manager:
+The plugin should also show up in your UI's update manager:
 - **Mainsail**: Settings → Update Manager
 - **Fluidd**: Settings → Updates
 
-When new releases are published on GitHub, the UI will offer an **Update** button — one click installs the latest version, restarts Klipper, and you're done.
-
-You can also verify on the command line:
-```bash
-TMC_FLOW_STATUS
-```
+When new releases land on GitHub, the UI will offer an **Update** button — one click installs the latest version, restarts Klipper, done.
 
 ## Updating later
 
@@ -165,7 +156,17 @@ Three options, all equivalent:
 - **Command line** — `cd ~/klipper_max_flow_test && git pull && sudo systemctl restart klipper`
 - **Moonraker API** — `curl -X POST 'http://<your-printer>/machine/update/client?name=Crydteam-Tuning-Plugins'`
 
-> **About the `managed_services: klipper` line**: After every plugin update Moonraker will automatically restart Klipper. This is safe — only restart-relevant Python is reloaded — but if you'd prefer to control restarts yourself, change to `managed_services: ` (empty) and run `systemctl restart klipper` manually after each update.
+> **About the auto-restart**: The `managed_services: klipper` line in the moonraker.conf block makes Moonraker automatically restart Klipper after each update. This is safe but if you'd rather control restarts yourself, edit the block in your `moonraker.conf` to read `managed_services: ` (empty) and restart manually after each update.
+
+## Custom install paths
+
+If your Klipper or printer-data folder lives somewhere non-standard, set environment variables before calling the script:
+
+```bash
+KLIPPER_PATH=/path/to/klipper bash install.sh
+```
+
+The script also auto-detects whether Moonraker is installed — if `~/printer_data/config/moonraker.conf` doesn't exist, the moonraker registration step is silently skipped (Klipper-only setup is supported).
 
 ## Configuration
 
