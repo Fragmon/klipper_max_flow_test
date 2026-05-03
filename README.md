@@ -23,7 +23,10 @@ Plugin by **Steven (Fragmon) — Crydteam**
   - [How the test works](#how-the-test-works)
   - [Supported drivers](#supported-drivers)
 - [Installation](#installation)
-  - [Quick install](#quick-install)
+  - [Step 1 — Clone and install](#step-1--clone-and-install)
+  - [Step 2 — Add the Moonraker update-manager block](#step-2--add-the-moonraker-update-manager-block)
+  - [Step 3 — Verify](#step-3--verify)
+  - [Updating later](#updating-later)
   - [Compatibility](#compatibility)
 - [Configuration](#configuration)
   - [TMC driver section](#tmc-driver-section)
@@ -99,24 +102,72 @@ A complete test typically takes **10–13 minutes**.
 
 # Installation
 
-## Quick install
+The plugin installs as a **symlink** from a cloned repo into Klipper's extras directory. This is intentional: writing a real file into `klipper/klippy/extras/` causes Moonraker / KIAUH / git to flag the Klipper repo as *dirty* or *corrupt* on its next refresh. With a symlink, the actual plugin file lives outside the Klipper repo and Klipper just follows the link.
 
-1. **Download the plugin**:
-   ```bash
-   cd ~/klipper/klippy/extras && \
-   wget -O tmc_flow_test.py https://raw.githubusercontent.com/Fragmon/klipper_max_flow_test/main/tmc_flow_test.py
-   ```
-   *(Kalico users: same path — Kalico ships its `extras/` at the same location.)*
+## Step 1 — Clone and install
 
-2. **Configure** your `[tmcXXXX extruder]` and add a `[tmc_flow_test]` section — see [Configuration](#configuration) below.
+```bash
+cd ~
+git clone https://github.com/Fragmon/klipper_max_flow_test.git
+cd klipper_max_flow_test
+./install.sh
+sudo systemctl restart klipper
+```
 
-3. **Restart the Klipper service**:
-   ```bash
-   sudo systemctl restart klipper
-   ```
-   > ⚠️ `FIRMWARE_RESTART` is **not** enough — the Python plugin only reloads on service restart.
+The install script:
+- validates the Python file syntax before doing anything
+- creates a **symbolic link** `~/klipper/klippy/extras/tmc_flow_test.py` → `~/klipper_max_flow_test/tmc_flow_test.py`
+- clears stale Python caches
+- prints the moonraker.conf snippet for the next step
 
-4. Verify the plugin loaded by running `TMC_FLOW_STATUS` from the console.
+> ⚠️ `FIRMWARE_RESTART` is **not** enough — the Python plugin only reloads on Klipper service restart. The install script does not restart Klipper for you.
+
+If the install script detects a *real* file (not a symlink) at the target path from a previous manual install, it backs it up to `tmc_flow_test.py.bak` and replaces it with the symlink — so it's safe to re-run on existing installs.
+
+## Step 2 — Add the Moonraker update-manager block
+
+Open your `~/printer_data/config/moonraker.conf` (or `~/klipper_config/moonraker.conf` on older installs) and add:
+
+```ini
+[update_manager Crydteam-Tuning-Plugins]
+type: git_repo
+primary_branch: main
+path: ~/klipper_max_flow_test
+origin: https://github.com/Fragmon/klipper_max_flow_test.git
+managed_services: klipper
+```
+
+Then restart Moonraker:
+```bash
+sudo systemctl restart moonraker
+```
+
+## Step 3 — Verify
+
+The plugin should now appear in your UI's update manager:
+- **Mainsail**: Settings → Update Manager
+- **Fluidd**: Settings → Updates
+
+When new releases are published on GitHub, the UI will offer an **Update** button — one click installs the latest version, restarts Klipper, and you're done.
+
+You can also verify on the command line:
+```bash
+TMC_FLOW_STATUS
+```
+
+## Updating later
+
+Three options, all equivalent:
+
+- **Mainsail / Fluidd UI** — click "Update" in the update-manager panel (recommended)
+- **Command line** — `cd ~/klipper_max_flow_test && git pull && sudo systemctl restart klipper`
+- **Moonraker API** — `curl -X POST 'http://<your-printer>/machine/update/client?name=Crydteam-Tuning-Plugins'`
+
+> **About the `managed_services: klipper` line**: After every plugin update Moonraker will automatically restart Klipper. This is safe — only restart-relevant Python is reloaded — but if you'd prefer to control restarts yourself, change to `managed_services: ` (empty) and run `systemctl restart klipper` manually after each update.
+
+## Configuration
+
+Configure your `[tmcXXXX extruder]` and add a `[tmc_flow_test]` section — see [Configuration](#configuration) below.
 
 ## Compatibility
 
