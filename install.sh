@@ -6,6 +6,19 @@
 
 set -e
 
+# ─── Self-bootstrap: ensure execute bits are set ──────────────────────
+# When this repo is cloned via GitHub Web-UI uploads or transferred
+# through some non-Git tools, the executable bit on shell scripts can
+# get stripped. Re-set it here so future runs work as `./install.sh`
+# (no need for `bash install.sh`).
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+if [ ! -x "${SCRIPT_PATH}" ]; then
+    chmod +x "${SCRIPT_PATH}" 2>/dev/null || true
+fi
+# Also fix any other .sh files in the repo root, just in case.
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+find "${SCRIPT_DIR}" -maxdepth 1 -name "*.sh" -exec chmod +x {} \; 2>/dev/null || true
+
 # ─── Defaults ─────────────────────────────────────────────────────────
 KLIPPER_DIR="${KLIPPER_DIR:-${HOME}/klipper}"
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
