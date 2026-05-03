@@ -11,7 +11,7 @@ Plugin by **Steven (Fragmon) — Crydteam**
 [![YouTube](https://img.shields.io/badge/YouTube-@crydteamprinting-red?logo=youtube)](https://www.youtube.com/@crydteamprinting)
 
 <p align="center">
-  <img src="images/results.png?v=3.1" alt="TMC Flow Test HTML report" width="700">
+  <img src="images/results.png?v=1.0" alt="TMC Flow Test HTML report" width="700">
 </p>
 
 ---
@@ -43,6 +43,7 @@ Plugin by **Steven (Fragmon) — Crydteam**
   - [HTML report structure](#html-report-structure)
   - [CSV columns](#csv-columns)
   - [How slip detection works](#how-slip-detection-works)
+  - [Plateau and IQR-growth triggers](#plateau-and-iqr-growth-triggers)
   - [Thermal monitoring & cold-extrusion hints](#thermal-monitoring--cold-extrusion-hints)
 - [TMC2209-specific information](#tmc2209-specific-information)
   - [Why TMC2209 is experimental](#why-tmc2209-is-experimental)
@@ -122,7 +123,7 @@ A complete test typically takes **10–13 minutes**.
 | Software | Status |
 |---|---|
 | **Klipper** (vanilla) | ✅ Tested |
-| **Kalico** | ✅ Tested (v3.1+ has the `_pstdev` workaround for stdlib shadowing) |
+| **Kalico** | ✅ Tested (uses a local `_pstdev` to avoid Kalico's `statistics.py` shadowing stdlib) |
 | **DangerKlipper** | ✅ Should work (same plugin path) |
 
 The plugin uses only stdlib Python imports plus Klipper's `gcode`, `pins`, and `tmc` modules — no external dependencies.
@@ -314,7 +315,7 @@ TMC_FLOW_FIND_MAX MAX=120 START=25 COARSE_STEP=5
 
 Test takes ~10–13 minutes total (~1–2 min for Auto-SGT calibration plus ~10 min for the actual sweep). Add 30–60 s if borderline measurements need re-testing. CSV and HTML report land in `~/printer_data/config/Flowtest/`.
 
-> **Why `COARSE_STEP=5`?** v3.1 introduced two new triggers — *single-step plateau* and *IQR cumulative growth* — that need at least 5 coarse steps of history to fire reliably. With `COARSE_STEP=5` you get ~20 steps for the typical range, giving every detection algorithm enough data. The legacy default `COARSE_STEP=10` still works but is less sensitive on low-flow setups.
+> **Why `COARSE_STEP=5`?** Two of the trigger algorithms (*single-step plateau* and *IQR cumulative growth*) need at least 5 coarse steps of history to fire reliably. With `COARSE_STEP=5` you get ~20 steps for the typical range, giving every detection algorithm enough data. `COARSE_STEP=10` still works but is less sensitive on low-flow setups.
 
 For other setups, see the table in [Choosing the test range](#choosing-the-test-range).
 
@@ -446,7 +447,7 @@ tmc_flow_YYYY-MM-DD_HH-MM-SS.html    ← interactive dashboard report
 
 ## HTML report structure
 
-The v3.1 report is a complete dashboard rewrite:
+The HTML report is a dashboard layout:
 
 - **Hero panel** — big result number (max safe flow) with 80 % / 90 % slicer recommendations and a status pill
 - **Insight cards** — 4 colour-coded summaries: result quality, first trigger, thermal watch (with stress-score state), driver config
@@ -484,11 +485,11 @@ Each trigger fires under tighter conditions in **bisection / verify** than in co
 
 The HTML report's **decision-trail panel** lists every trigger event with the metrics that caused it, so you can see exactly why the plugin chose the value it did.
 
-### New triggers in v3.1
+### Plateau and IQR-growth triggers
 
-Two triggers were added in v3.1 to catch slip patterns that older versions missed:
+Two of the most important trigger types deserve explanation:
 
-- **Single-step plateau** — fires when the most recent step's SG-delta is essentially flat compared to the recent baseline (e.g. typical −25 deltas then suddenly +0.5). Catches abrupt plateaus that the 2-step cumulative trigger would smooth over.
+- **Single-step plateau** — fires when the most recent step's SG-delta is essentially flat compared to the recent baseline (e.g. typical −25 deltas then suddenly +0.5). Catches abrupt plateaus that a 2-step cumulative trigger would smooth over.
 - **IQR cumulative growth** — fires when within-step spread has gradually doubled relative to the early-test baseline AND now exceeds an absolute floor of 12 raw units. Catches gradual stick-slip onset that single-step ratio triggers don't see.
 
 ### Warmup-skip
@@ -645,10 +646,10 @@ The plugin file isn't being loaded. Common causes:
 1. File at wrong path → must be `~/klipper/klippy/extras/tmc_flow_test.py`
 2. Service not restarted → run `sudo systemctl restart klipper` (NOT `FIRMWARE_RESTART`)
 3. Stale Python cache → `rm -f ~/klipper/klippy/extras/__pycache__/tmc_flow_test*.pyc` then restart
-4. **Kalico**: see compatibility note below — make sure your file is from v3.1 or later
+4. **Kalico**: see compatibility note above — the plugin needs the `_pstdev` workaround that's part of the current release
 
 **Plugin throws `ImportError: attempted relative import with no known parent package`** —
-You're on Kalico (or another Klipper fork) that ships its own `extras/statistics.py`, which shadows Python's stdlib `statistics`. **v3.1 fixes this** — make sure you have the latest plugin (no `import statistics` at top of file).
+You're on Kalico (or another Klipper fork) that ships its own `extras/statistics.py`, which shadows Python's stdlib `statistics`. The plugin works around this with a local `_pstdev` helper — make sure you have the latest version of `tmc_flow_test.py` (no `import statistics` at top of file) and re-pull from the repo if needed.
 
 **`TMC_FLOW_STATUS` reports "StallGuard2 needs SpreadCycle"** *(SG2 drivers — TMC5160, TMC2130, TMC2240)* —
 Remove the `stealthchop_threshold:` line entirely from your TMC section, restart Klipper. For TMC2240: also remove any `[delayed_gcode]` block that sets `sg4_thrs` or `sg4_filt_en` — they're not needed in SG2 mode.
@@ -666,7 +667,7 @@ Most common causes:
 Either your hotend really can flow that fast (raise MAX), or SG sensitivity is still too low. Check the Auto-SGT output — if it tuned to a very high SGT (e.g. > 30), your motor torque headroom is bigger than the test's MAX value.
 
 **Test ends without trigger and the chart shows a clear plateau** —
-This used to happen when `COARSE_STEP=10` skipped over a fast plateau onset. v3.1 added a single-step plateau trigger that catches this. If you see this on v3.1, lower `COARSE_STEP` to 5 — the IQR cumulative growth trigger needs ≥5 coarse steps of history to fire.
+If `COARSE_STEP=10` skips over the slip onset, the single-step plateau trigger may not have enough resolution. Lower `COARSE_STEP` to 5 — the IQR cumulative growth trigger needs ≥5 coarse steps of history to fire, so 5 mm³/s steps give the algorithm enough data.
 
 **TMC2240 results much lower than expected (<70 mm³/s on a fast extruder)** —
 Check that you're running in **SpreadCycle/SG2** mode, not StealthChop/SG4. The SG4 path of the TMC2240 reduces peak torque by ~50 %. `TMC_FLOW_STATUS` will tell you which mode is active. Remove `stealthchop_threshold` from your `[tmc2240]` section if present.
