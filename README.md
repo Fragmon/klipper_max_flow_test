@@ -110,9 +110,11 @@ The plugin installs as a **symlink** from a cloned repo into Klipper's extras di
 cd ~
 git clone https://github.com/Fragmon/klipper_max_flow_test.git
 cd klipper_max_flow_test
-./install.sh
+bash install.sh
 sudo systemctl restart klipper
 ```
+
+> **Why `bash install.sh` and not `./install.sh`?** When uploads transit through GitHub's Web-UI or some non-Git tools, the executable bit on shell scripts can get stripped. Calling the script via `bash` avoids that. The script will set its own execute bit on first run, so subsequent runs (e.g. after `git pull`) can use `./install.sh` directly.
 
 The install script:
 - validates the Python file syntax before doing anything
