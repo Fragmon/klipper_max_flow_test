@@ -63,8 +63,8 @@ Your existing `[tmcXXXX extruder]` section also needs `driver_SFILT: 1` (TMC5160
 - V6 / Revo Six: ~13 mm
 - Volcano: ~21 mm
 - Mosquito: ~18 mm
-- Sherpa Mini / high-flow: ~42 mm
-- Goliath / CHT-XL: ~50 mm
+- Chube Air: ~42 mm
+- Goliath / CHC-XL: ~50 mm
 
 ## Run a test
 
@@ -86,7 +86,7 @@ Set MAX to roughly 1.5× what you think your hotend can flow:
 | Volcano / CHT 0.4 (~25 mm³/s) | `TMC_FLOW_FIND_MAX MAX=40 START=10 COARSE_STEP=5` |
 | Rapido HF 0.4 (~30 mm³/s) | `TMC_FLOW_FIND_MAX MAX=60 START=10 COARSE_STEP=5` |
 | Rapido HF 0.6 (~50 mm³/s) | `TMC_FLOW_FIND_MAX MAX=80 START=15 COARSE_STEP=5` |
-| Goliath / CHT 0.8 (~80 mm³/s) | `TMC_FLOW_FIND_MAX MAX=120 START=25 COARSE_STEP=5` |
+| Goliath / Chc XL 0.8 (~80 mm³/s) | `TMC_FLOW_FIND_MAX MAX=120 START=25 COARSE_STEP=5` |
 | Unknown | `TMC_FLOW_FIND_MAX MAX=150 START=10 COARSE_STEP=5` |
 
 If the test reaches MAX without detecting slip, **double MAX** and re-run.
