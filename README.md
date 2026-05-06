@@ -16,8 +16,6 @@ Plugin by **Steven (Fragmon) — Crydteam**
 
 ## What it does
 
-CNC Kitchen tests filaments with a precision scale. With this plugin **your printer does the same thing for itself, automatically.** No test prints, no scale, no measuring spaghetti. Just StallGuard.
-
 The plugin runs your extruder at progressively higher flow rates and watches the TMC driver's stall signal to find the exact point where the motor starts losing grip. Output: an interactive dashboard showing your max safe flow, the slip onset curve, and recommended slicer values (80% conservative / 90% aggressive).
 
 **Result:** A printer-specific flow curve in 30 minutes, with the same level of detail as a CNC Kitchen video — for free.
