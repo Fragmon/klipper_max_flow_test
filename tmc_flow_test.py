@@ -25,6 +25,19 @@ def _pstdev(values):
     return math.sqrt(variance)
 
 
+def _sanitize_csv(name):
+    """Make a thermistor object name CSV-column-safe: ASCII alnum
+    plus underscore. 'temperature_sensor chamber' -> 'temperature_sensor_chamber'.
+    """
+    out = []
+    for ch in name:
+        if ch.isalnum() or ch == '_':
+            out.append(ch)
+        else:
+            out.append('_')
+    return ''.join(out) or 'sensor'
+
+
 SAMPLE_INTERVAL = 0.05    # 20 Hz polling
 MIN_HOTEND_TEMP = 180.0
 MODULE_NAME = "TMC Flow Test"
@@ -360,6 +373,33 @@ class TMCFlowTest:
             'melt_zone_length', 42.0, above=0.)
         self.min_hotend_temp = config.getfloat(
             'min_hotend_temp', MIN_HOTEND_TEMP, above=0.)
+
+        # Part-cooling fan speed during the test (0-100 %). Set in
+        # config or override via `FAN_SPEED=` on TMC_FLOW_FIND_MAX.
+        # Once the test starts the value is locked — printer-cooling
+        # fans actually have non-trivial impact on max flow (heater
+        # has to do ~10-20 % more work to maintain temperature when
+        # fan is at 100 % vs off), so consistency matters more than
+        # flexibility here.
+        self.test_fan_speed = config.getfloat(
+            'test_fan_speed', 0.0, minval=0.0, maxval=100.0)
+        # Optional: explicitly name the fan to control. Default is
+        # the printer's primary part-cooling fan via M106.
+        self.fan_object_name = config.get('fan_object_name', '').strip()
+
+        # Optional list of additional thermistors to log alongside the
+        # extruder's. Useful for chamber, heatbreak, ambient, etc.
+        # Comma-separated list of object names like:
+        #   extra_thermistors: chamber, heater_generic heatbreak
+        # Each name must be the printer-config-section header (see
+        # `[temperature_sensor name]` and similar). Names that don't
+        # resolve are silently skipped at test start.
+        extras_raw = config.get('extra_thermistors', '').strip()
+        if extras_raw:
+            self.extra_thermistors = [
+                n.strip() for n in extras_raw.split(',') if n.strip()]
+        else:
+            self.extra_thermistors = []
 
         config_dir = os.path.expanduser('~/printer_data/config')
         if not os.path.isdir(config_dir):
@@ -773,14 +813,30 @@ class TMCFlowTest:
                 for label, value, raw in tmc_settings:
                     f.write("#   %s = %s  [%s]\n" % (label, value, raw))
 
+            # Determine extra-thermistor names that appear in any
+            # result, so we can emit a stable column order.
+            extra_names = []
+            seen = set()
+            for r in results:
+                th = r.get('thermal') or {}
+                for name in (th.get('extras') or {}).keys():
+                    if name not in seen:
+                        seen.add(name)
+                        extra_names.append(name)
+
             # CSV header
-            f.write("phase,flow_mm3s,sg_median,sg_p25,sg_p75,sg_avg,"
-                    "sg_min,sg_max,sg_n,n_repeats,sg_run_cv_pct,"
-                    "run_sg_avgs,"
-                    "temp_target,temp_start,temp_end,temp_min,"
-                    "temp_avg,temp_drop,"
-                    "pwm_min,pwm_max,pwm_avg,"
-                    "tmc_otpw,tmc_ot\n")
+            base_header = ("phase,flow_mm3s,sg_median,sg_p25,sg_p75,sg_avg,"
+                           "sg_min,sg_max,sg_n,n_repeats,sg_run_cv_pct,"
+                           "run_sg_avgs,"
+                           "temp_target,temp_start,temp_end,temp_min,"
+                           "temp_avg,temp_drop,"
+                           "pwm_min,pwm_max,pwm_avg,"
+                           "tmc_otpw,tmc_ot")
+            extra_header = "".join(
+                ",extra_%s_min,extra_%s_avg,extra_%s_max"
+                % (_sanitize_csv(n), _sanitize_csv(n), _sanitize_csv(n))
+                for n in extra_names)
+            f.write(base_header + extra_header + "\n")
 
             for r in results:
                 sg = r.get('sg') or {}
@@ -813,11 +869,11 @@ class TMCFlowTest:
                         return ''
                     return "%d" % v
 
-                f.write("%s,%.2f,%s,%s,%s,%s,%s,%s,%s,"
-                        "%d,%s,%s,"
-                        "%s,%s,%s,%s,%s,%s,"
-                        "%s,%s,%s,"
-                        "%s,%s\n" % (
+                base_row = ("%s,%.2f,%s,%s,%s,%s,%s,%s,%s,"
+                            "%d,%s,%s,"
+                            "%s,%s,%s,%s,%s,%s,"
+                            "%s,%s,%s,"
+                            "%s,%s") % (
                     phase,
                     r['flow'],
                     fmt(sg, 'median'), fmt(sg, 'p25'), fmt(sg, 'p75'),
@@ -837,7 +893,20 @@ class TMCFlowTest:
                     fmt_pwm(th, 'pwm_avg'),
                     fmt_flag(th, 'tmc_otpw_any'),
                     fmt_flag(th, 'tmc_ot_any'),
-                ))
+                )
+                # Append extra-thermistor columns in the same order
+                # as the header.
+                extras = (th.get('extras') or {})
+                extra_cols = []
+                for name in extra_names:
+                    e = extras.get(name) or {}
+                    extra_cols.append(fmt_t(e, 'min'))
+                    extra_cols.append(fmt_t(e, 'avg'))
+                    extra_cols.append(fmt_t(e, 'max'))
+                f.write(base_row
+                        + ("," + ",".join(extra_cols)
+                           if extra_cols else "")
+                        + "\n")
 
     def _write_html(self, path, results, meta, limit_reason,
                     final_result=None):
@@ -899,6 +968,26 @@ class TMCFlowTest:
         pwm_max     = [th(r, 'pwm_max') for r in results_for_charts]
         tmc_otpw    = [th(r, 'tmc_otpw_any') for r in results_for_charts]
         tmc_ot      = [th(r, 'tmc_ot_any') for r in results_for_charts]
+
+        # Extra thermistors: collect a stable column-order across all
+        # steps, then per-step avg per sensor as parallel arrays.
+        extras_seen = []
+        extras_seen_set = set()
+        for r in results_for_charts:
+            t = r.get('thermal') or {}
+            for n in (t.get('extras') or {}).keys():
+                if n not in extras_seen_set:
+                    extras_seen_set.add(n)
+                    extras_seen.append(n)
+        extras_per_step = {}
+        for name in extras_seen:
+            vals = []
+            for r in results_for_charts:
+                t = r.get('thermal') or {}
+                extras = t.get('extras') or {}
+                e = extras.get(name) or {}
+                vals.append(e.get('avg'))
+            extras_per_step[name] = vals
 
         # Intra-run drift load (Phase 3 thermal indicator)
         def ir(r, key):
@@ -1710,6 +1799,45 @@ header .container {
 .section-title { font-size: 18px; font-weight: 700; color: var(--text-primary);
                  letter-spacing: -0.01em; }
 .section-meta { font-size: 12px; color: var(--text-tertiary); font-family: var(--font-mono); }
+.setup-notes-section .section-meta { font-family: inherit; }
+.notes-export-btn {
+    background: var(--bg-card); color: var(--text-primary);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 12px; font-family: inherit; font-size: 12px;
+    cursor: pointer; transition: all 0.15s;
+}
+.notes-export-btn:hover {
+    border-color: var(--accent); color: var(--accent);
+}
+.setup-notes-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 12px;
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 20px;
+}
+.setup-field { display: flex; flex-direction: column; gap: 4px; }
+.setup-field-wide { grid-column: 1 / -1; }
+.setup-field label {
+    font-size: 11px; font-weight: 600;
+    color: var(--text-tertiary); letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+.setup-field input, .setup-field textarea {
+    background: var(--bg-page); color: var(--text-primary);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 10px; font-family: inherit; font-size: 13px;
+    transition: border-color 0.15s;
+    width: 100%%; box-sizing: border-box;
+}
+.setup-field input:focus, .setup-field textarea:focus {
+    outline: none; border-color: var(--accent);
+}
+.setup-field textarea { resize: vertical; min-height: 60px; }
+.setup-notes-help {
+    margin-top: 12px; font-size: 12px; color: var(--text-tertiary);
+    line-height: 1.5;
+}
 .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
 .tab { padding: 8px 16px; background: transparent; border: none;
        color: var(--text-secondary); font-family: inherit; font-size: 13px;
@@ -1815,6 +1943,55 @@ footer a:hover { text-decoration: underline; }
 %(hero_html)s
 
 %(insights_html)s
+
+<div class="section setup-notes-section">
+  <div class="section-header">
+    <div class="section-title">Setup Notes</div>
+    <div class="section-meta">
+      <button id="exportNotesBtn" class="notes-export-btn"
+              title="Save these fields into the HTML so reopening keeps them"
+              onclick="saveSetupNotes()">💾 Bake into HTML</button>
+    </div>
+  </div>
+  <div class="setup-notes-grid">
+    <div class="setup-field">
+      <label>Hotend</label>
+      <input type="text" data-key="hotend"
+             placeholder="e.g. Rapido HF, Volcano…">
+    </div>
+    <div class="setup-field">
+      <label>Extruder</label>
+      <input type="text" data-key="extruder"
+             placeholder="e.g. Sherpa Mini, Orbiter v2…">
+    </div>
+    <div class="setup-field">
+      <label>Nozzle</label>
+      <input type="text" data-key="nozzle"
+             placeholder="e.g. Bondtech CHT 0.4 brass…">
+    </div>
+    <div class="setup-field">
+      <label>Filament</label>
+      <input type="text" data-key="filament"
+             placeholder="e.g. Polymaker PolyLite PLA, black, 1.75…">
+    </div>
+    <div class="setup-field">
+      <label>Filament manufacturer</label>
+      <input type="text" data-key="manufacturer"
+             placeholder="e.g. Polymaker, Sunlu, Prusament…">
+    </div>
+    <div class="setup-field setup-field-wide">
+      <label>Notes (free text)</label>
+      <textarea rows="3" data-key="notes"
+                placeholder="Anything else worth recording for later: chamber temp, filament age, drying schedule…"></textarea>
+    </div>
+  </div>
+  <div class="setup-notes-help">
+    Fill in any fields you want to record alongside this report. Click
+    <strong>💾 Bake into HTML</strong> to write the values into this file's
+    HTML — that way the report can be saved/shared and the values stay with it.
+    Otherwise the fields persist only in your browser.
+  </div>
+</div>
 
 <div class="section">
   <div class="section-header">
@@ -2032,6 +2209,56 @@ function showTab(event, name) {
     document.getElementById('tab-' + name).classList.add('active');
 }
 
+// ─── Setup-notes persistence ────────────────────────────────────────
+// Two layers of persistence:
+// (1) Live-edits in localStorage so the fields survive a page reload.
+// (2) "Bake into HTML" button writes the values into the document
+//     itself, so saving the HTML preserves the values.
+const NOTES_KEY = 'tmc_flow_notes_' + (document.title || 'report');
+function loadSetupNotes() {
+    document.querySelectorAll('.setup-field [data-key]').forEach(el => {
+        // (a) prefer a value baked into the HTML attribute
+        const baked = el.getAttribute('data-baked');
+        if (baked !== null && baked !== '') {
+            el.value = baked;
+            return;
+        }
+        // (b) otherwise restore from localStorage
+        try {
+            const saved = localStorage.getItem(NOTES_KEY + ':' + el.dataset.key);
+            if (saved !== null) el.value = saved;
+        } catch (e) {}
+    });
+    // Persist on every change
+    document.querySelectorAll('.setup-field [data-key]').forEach(el => {
+        el.addEventListener('input', () => {
+            try {
+                localStorage.setItem(
+                    NOTES_KEY + ':' + el.dataset.key, el.value);
+            } catch (e) {}
+        });
+    });
+}
+function saveSetupNotes() {
+    // Bake current values into the document's HTML so a Save-As keeps
+    // them. We write the value as `data-baked="..."` on each input.
+    document.querySelectorAll('.setup-field [data-key]').forEach(el => {
+        el.setAttribute('data-baked', el.value);
+        // Also set the `value` attribute for inputs / textContent for
+        // textarea so the serialized HTML reflects the live value.
+        if (el.tagName.toLowerCase() === 'textarea') {
+            el.textContent = el.value;
+        } else {
+            el.setAttribute('value', el.value);
+        }
+    });
+    const btn = document.getElementById('exportNotesBtn');
+    const orig = btn.textContent;
+    btn.textContent = '✓ Baked. Now File → Save Page As…';
+    setTimeout(() => { btn.textContent = orig; }, 4000);
+}
+window.addEventListener('DOMContentLoaded', loadSetupNotes);
+
 const flows = %(flows)s;
 const phases = %(phases)s;
 const sgMedian = %(sg_median)s;
@@ -2057,6 +2284,8 @@ const coldExtrusionHint = %(cold_extrusion_hint)s;
 const coldOnsetFlow = %(cold_onset_flow)s;
 const stressScores = %(stress_scores)s;
 const intraDrift = %(intra_drift)s;
+const extrasNames = %(extras_names)s;
+const extrasData = %(extras_data)s;
 
 Chart.defaults.color = '#8b949e';
 Chart.defaults.borderColor = '#30363d';
@@ -2287,6 +2516,43 @@ if (hasThermalData) {
         tempYMax = Math.max(...validTemps, ...validTargets) + 2;
     }
 
+    // Build extra-thermistor datasets dynamically (e.g. chamber,
+    // heatbreak). Each gets a unique colour from a small palette so
+    // up to ~6 extras read clearly. Toggle via legend click.
+    const extraColours = [
+        '#56d364', // green
+        '#79c0ff', // light blue
+        '#d2a8ff', // purple
+        '#ffa657', // orange
+        '#a5a5a5', // grey
+        '#ff7b72', // salmon
+    ];
+    const extraDatasets = [];
+    for (let i = 0; i < extrasNames.length; i++) {
+        const name = extrasNames[i];
+        const data = extrasData[name] || [];
+        // Skip sensors that produced no usable data
+        if (!data.some(v => v !== null && v !== undefined)) continue;
+        // Update tempYMin/tempYMax to cover the extra sensor range
+        const valid = data.filter(v => v !== null && v !== undefined);
+        if (valid.length > 0) {
+            const lo = Math.min(...valid);
+            const hi = Math.max(...valid);
+            if (tempYMin === null || lo - 2 < tempYMin) tempYMin = lo - 2;
+            if (tempYMax === null || hi + 2 > tempYMax) tempYMax = hi + 2;
+        }
+        extraDatasets.push({
+            label: name,
+            data: asPoints(data),
+            borderColor: extraColours[i %% extraColours.length],
+            borderWidth: 2,
+            borderDash: [5, 4],
+            fill: false,
+            pointRadius: 3,
+            yAxisID: 'yTemp',
+        });
+    }
+
     new Chart(document.getElementById('thermalChart'), {
         type: 'line',
         data: { datasets: [
@@ -2301,6 +2567,7 @@ if (hasThermalData) {
               borderColor: 'rgba(255, 152, 0, 0.6)',
               borderDash: [2, 4], borderWidth: 1, fill: false,
               pointRadius: 2, yAxisID: 'yTemp' },
+            ...extraDatasets,
             { label: 'heater PWM (avg)', data: asPoints(pwmAvg),
               borderColor: '#d29922',
               backgroundColor: 'rgba(210, 153, 34, 0.18)',
@@ -2606,6 +2873,10 @@ new Chart(document.getElementById('cvChart'), {
             # Filament-speed / residence-time helpers
             'linear_speeds': json.dumps(linear_speeds),
             'residence_times': json.dumps(residence_times),
+            # Extra thermistors (chamber, heatbreak, etc.). Each one
+            # becomes a separate dotted line on the thermal chart.
+            'extras_names': json.dumps(extras_seen),
+            'extras_data': json.dumps(extras_per_step),
         }
         with open(path, 'w') as f:
             f.write(rendered)
@@ -2657,6 +2928,7 @@ new Chart(document.getElementById('cvChart'), {
             'heater_pwm': None,     # current heater PWM, 0.0-1.0
             'tmc_otpw': None,       # TMC over-temperature warning flag (≥120 °C)
             'tmc_ot': None,         # TMC over-temperature error flag (≥150 °C)
+            'extras': {},           # name -> temperature for extra thermistors
         }
 
         # Hotend temp + PWM via Klipper extruder/heater objects
@@ -2687,6 +2959,28 @@ new Chart(document.getElementById('cvChart'), {
                 except (KeyError, AttributeError):
                     pass
 
+        # Extra thermistors (chamber, heatbreak, ambient, etc.).
+        # Each one is looked up by its full Klipper object name.
+        # Resolution failures are silent so a printer.cfg change that
+        # removes a thermistor doesn't break the test mid-run.
+        if self.extra_thermistors:
+            now = self.reactor.monotonic()
+            for name in self.extra_thermistors:
+                try:
+                    obj = self.printer.lookup_object(name)
+                    # temperature_sensor: has .last_temp; generic
+                    # heaters: get_temp(eventtime) returns (cur, target).
+                    if hasattr(obj, 'get_temp'):
+                        result = obj.get_temp(now)
+                        # heater-style returns tuple (cur, target)
+                        cur = (result[0] if isinstance(result, tuple)
+                               else result)
+                        snap['extras'][name] = float(cur)
+                    elif hasattr(obj, 'last_temp'):
+                        snap['extras'][name] = float(obj.last_temp)
+                except Exception:
+                    pass  # not a temp sensor or doesn't exist
+
         return snap
 
     @staticmethod
@@ -2701,6 +2995,7 @@ new Chart(document.getElementById('cvChart'), {
             'temp_target': None, 'temp_drop': None,
             'pwm_min': None, 'pwm_max': None, 'pwm_avg': None,
             'tmc_otpw_any': 0, 'tmc_ot_any': 0,
+            'extras': {},
         }
         if not samples:
             return agg
@@ -2737,6 +3032,26 @@ new Chart(document.getElementById('cvChart'), {
         agg['tmc_ot_any'] = int(any(
             s.get('tmc_ot') for s in samples
             if s.get('tmc_ot') is not None))
+
+        # Extra thermistors: aggregate min/max/avg per sensor name
+        extras_agg = {}
+        # Collect all extra-sensor names that appeared in any sample
+        all_extras = set()
+        for s in samples:
+            extras = s.get('extras') or {}
+            all_extras.update(extras.keys())
+        for name in all_extras:
+            vals = [s['extras'][name] for s in samples
+                    if s.get('extras')
+                    and name in s['extras']
+                    and s['extras'][name] is not None]
+            if vals:
+                extras_agg[name] = {
+                    'min': min(vals),
+                    'max': max(vals),
+                    'avg': sum(vals) / len(vals),
+                }
+        agg['extras'] = extras_agg
 
         return agg
 
@@ -4922,6 +5237,100 @@ new Chart(document.getElementById('cvChart'), {
                 "     have non-functional SG4). Try a different\n"
                 "     TMC2209 board, or switch to TMC2240.")
 
+    # ─── Fan + extra-thermistor helpers ─────────────────────────────
+
+    def _capture_current_fan_speed(self):
+        """Return current part-cooling fan speed as 0-100 percent.
+        Returns 0.0 if no fan is found or status can't be read.
+        """
+        fan_obj = self._lookup_fan_object()
+        if fan_obj is None:
+            return 0.0
+        try:
+            now = self.reactor.monotonic()
+            status = fan_obj.get_status(now)
+            speed_frac = status.get('speed', 0.0)
+            return float(speed_frac) * 100.0
+        except Exception:
+            return 0.0
+
+    def _set_part_cooling_fan(self, percent, gcmd, quiet=False):
+        """Set part-cooling fan to a given 0-100 percent.
+        Uses M106 by default (drives the printer's primary fan).
+        Falls back to no-op if no fan is configured.
+        """
+        # Clamp into valid M106 range
+        percent = max(0.0, min(100.0, float(percent)))
+        m106_value = int(round(percent / 100.0 * 255.0))
+        try:
+            if m106_value <= 0:
+                self.gcode.run_script_from_command("M107")
+            else:
+                self.gcode.run_script_from_command(
+                    "M106 S%d" % m106_value)
+        except Exception as e:
+            if not quiet:
+                gcmd.respond_info(
+                    "Could not set fan speed to %.0f %% (%s) — "
+                    "continuing without fan control." % (percent, e))
+
+    def _lookup_fan_object(self):
+        """Best-effort look-up of the printer's part-cooling fan object.
+
+        Tries:
+        1. The user-named object via [tmc_flow_test] fan_object_name.
+        2. 'fan' (Klipper's built-in [fan] section).
+        3. Any 'fan_generic <name>' that mentions 'part' in its name.
+        Returns None if nothing usable was found.
+        """
+        if self.fan_object_name:
+            try:
+                return self.printer.lookup_object(self.fan_object_name)
+            except Exception:
+                pass
+        # Default: M106 controls the [fan] section (Klipper's
+        # built-in primary part-cooling fan).
+        try:
+            return self.printer.lookup_object('fan')
+        except Exception:
+            pass
+        # Heuristic fallback: any fan_generic with 'part' in the name
+        try:
+            objs = self.printer.lookup_objects('fan_generic')
+            for name, obj in objs:
+                if 'part' in name.lower():
+                    return obj
+        except Exception:
+            pass
+        return None
+
+    def _resolve_extra_thermistors(self, gcmd):
+        """Verify configured extra thermistors actually exist.
+        Logs a notice for each one resolved, and a warning for
+        each one that doesn't exist.
+        """
+        if not self.extra_thermistors:
+            return
+        ok = []
+        missing = []
+        for name in self.extra_thermistors:
+            try:
+                obj = self.printer.lookup_object(name)
+                if hasattr(obj, 'get_temp') or hasattr(obj, 'last_temp'):
+                    ok.append(name)
+                else:
+                    missing.append((name, "no temperature interface"))
+            except Exception as e:
+                missing.append((name, str(e)))
+        if ok:
+            gcmd.respond_info(
+                "Extra thermistors logged this run: %s"
+                % ", ".join(ok))
+        for name, why in missing:
+            gcmd.respond_info(
+                "Extra thermistor '%s' not available (%s) — skipping."
+                % (name, why))
+
     # ─── Main commands ──────────────────────────────────────────────
 
     def cmd_TMC_FLOW_FIND_MAX(self, gcmd):
@@ -4952,6 +5361,12 @@ new Chart(document.getElementById('cvChart'), {
         keep_sgt = gcmd.get_int('KEEP_SGT', 0, minval=0, maxval=1)
         cold_extrusion_hint = gcmd.get_float(
             'COLD_EXTRUSION_HINT', 0.0, minval=0., maxval=200.)
+
+        # Part-cooling fan speed for the test. Defaults to the value
+        # in [tmc_flow_test] config (or 0 if not set). Override per
+        # invocation with FAN_SPEED=<percent>.
+        fan_speed_pct = gcmd.get_float(
+            'FAN_SPEED', self.test_fan_speed, minval=0.0, maxval=100.0)
 
         if min_step >= coarse_step:
             raise gcmd.error(
@@ -5064,6 +5479,20 @@ new Chart(document.getElementById('cvChart'), {
                 "a vertical line in the HTML report. The plugin's slip "
                 "detection ignores this value; it's purely informational."
                 % cold_extrusion_hint)
+
+        # ─── Resolve extra thermistors and store original fan speed ───
+        # Both happen here so they're locked in BEFORE any extrusion
+        # starts. Once the test runs, neither value should change.
+        self._resolve_extra_thermistors(gcmd)
+        original_fan_pct = self._capture_current_fan_speed()
+        self._set_part_cooling_fan(fan_speed_pct, gcmd)
+        if fan_speed_pct > 0:
+            gcmd.respond_info(
+                "Part-cooling fan locked at %.0f %% for the test "
+                "(was %.0f %% — restored at end). Fan speed materially "
+                "affects max flow; consistency matters more than "
+                "flexibility during a max-flow test."
+                % (fan_speed_pct, original_fan_pct))
 
         if purge > 0:
             self.gcode.run_script_from_command(
@@ -5457,6 +5886,13 @@ new Chart(document.getElementById('cvChart'), {
         # Restore SGT (unless KEEP_SGT=1)
         self._restore_sgt_if_needed(gcmd, original_sgt, final_sgt,
                                      keep_sgt)
+
+        # Restore part-cooling fan to whatever it was before the test
+        try:
+            self._set_part_cooling_fan(original_fan_pct, gcmd,
+                                       quiet=True)
+        except Exception:
+            pass
 
 
 def load_config(config):
