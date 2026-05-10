@@ -109,9 +109,18 @@ class TriggerProfile:
     SG_MAX_ABS_GAP_SG4 = 150        # absolute gap floor (sg4 chips)
     SG_MAX_BIG_RATIO = 4.0          # alt path — extreme ratio
     SG_MAX_BIG_GAP = 300            # alt path — extreme gap
+
     # ─── _check_sg_max_spike COARSE-phase thresholds ──────────────
+    # The coarse-phase path uses a separate, "gap-jump" criterion.
+    # It fires when (sg_max - sg_median) makes a big jump above the
+    # baseline gap from earlier coarse steps. This catches stick-slip
+    # stalls where the medians stay compact (so IQR/CV/median triggers
+    # all miss it) but sg_max suddenly records repeated decoupling
+    # spikes inside the runs. Conservative defaults to avoid early
+    # noise-driven false positives.
     COARSE_GAP_JUMP_RATIO = 2.0      # current gap >= 2x prior baseline gap
     COARSE_GAP_JUMP_ABS_FLOOR = 350  # current gap must clear this absolute floor
+    COARSE_GAP_JUMP_PREV_FRACTION = 0.7  # prev step's gap must also be ≥ 0.7×floor
     # Inverse direction (rare case where SG rises with load)
     SG_MIN_RATIO_TO_MEDIAN = 3.0
     SG_MIN_ABS_GAP = 80
@@ -286,6 +295,7 @@ class TMC2209Profile(TriggerProfile):
     SG_MAX_SPIKE_RATIO_BISECT = 99.0
     COARSE_GAP_JUMP_RATIO = 99.0     # disable coarse gap-jump for SG4
     COARSE_GAP_JUMP_ABS_FLOOR = 99999
+    COARSE_GAP_JUMP_PREV_FRACTION = 99.0
     PLATEAU_RATIO = 0.0             # 0 → never fire plateau
     PLATEAU_SATURATION_SKIP = 0     # n/a since plateau disabled
 
@@ -3661,14 +3671,19 @@ new Chart(document.getElementById('cvChart'), {
         signal regardless of driver. (We still keep a sg_min check as
         fallback in case a particular setup runs the other direction.)
 
-        Only fires in bisection / verify, since coarse has plenty of
-        other triggers and natural variation is wider there.
+        Fires in coarse / bisection / verify. Coarse uses tighter
+        thresholds because natural sg_max variation is wider there.
         """
         last = results[-1]
-        if last.get('phase') not in ('bisect', 'verify'):
-            return None
-        sg = last.get('sg') or {}
         phase = last.get('phase', 'coarse')
+        # Coarse path uses elevated thresholds (see below). The
+        # legacy "bisect/verify only" gate has been removed because a
+        # type of stick-slip stall produces compact medians/IQRs but
+        # very large sg_max recovery spikes — invisible to the
+        # standard triggers but obvious in sg_max if you look at it.
+        sg = last.get('sg') or {}
+        if 'max' not in sg or 'min' not in sg or 'median' not in sg:
+            return None
         last_max = sg['max']
         last_min = sg['min']
         last_med = sg['median']
@@ -3690,10 +3705,13 @@ new Chart(document.getElementById('cvChart'), {
             if 'median' in sg_p:
                 coarse_meds.append(sg_p['median'])
         if len(coarse_maxes) < 4 or len(coarse_meds) < 4:
+            # Coarse gap-jump path can work with fewer steps because
+            # the criterion is much stricter (gap_ratio AND abs_floor).
+            # Need at least 3 prior steps to have a meaningful baseline.
             if (phase == 'coarse'
                     and len(coarse_maxes) >= 3
                     and len(coarse_meds) >= 3):
-                pass
+                pass  # continue with coarse-only check below
             else:
                 return None
 
@@ -3719,32 +3737,31 @@ new Chart(document.getElementById('cvChart'), {
             # Normal case for all common driver setups. Decoupling →
             # SG snaps UP. Compare sg_max to typical coarse sg_max.
             median_coarse_max = _median(coarse_maxes[:-1])
+            # Use a separate, stricter "max-gap-jump" path tuned to
+            # the coarse phase: we want to fire when the gap (max-med)
+            # makes a big absolute jump above the prior coarse-baseline
+            # gap. This is the signature seen in stick-slip stalls
+            # where the medians stay compact but sg_max suddenly
+            # records repeated decoupling spikes.
             prior_gaps = [m - md for m, md in zip(coarse_maxes[:-1],
                                                   coarse_meds[:-1])
                           if m > md]
             baseline_gap = _median(prior_gaps) if prior_gaps else 0
             current_gap = last_max - last_med
+            # Pick threshold based on phase
             if phase == 'coarse':
-                if (baseline_gap > 0
-                        and current_gap >=
-                            baseline_gap * self.profile.COARSE_GAP_JUMP_RATIO
-                        and current_gap >=
-                            self.profile.COARSE_GAP_JUMP_ABS_FLOOR):
-                    return ("%s max-median gap %.0f in this step is "
-                            "%.1fx the prior coarse baseline (%.0f) "
-                            "— stall-recovery spikes inside the run "
-                            "(motor decoupling)"
-                            % (sg_label, current_gap,
-                               current_gap / max(baseline_gap, 1),
-                               baseline_gap))
-                return None
-            # Two paths to fire:
-            # (a) Strong ratio + above coarse: max is dramatically
-            #     above median AND clearly above what coarse saw.
-            # (b) Big absolute jump: max is far above median AND the
-            #     gap (max - median) is large. This covers narrow-range
-            #     drivers (e.g. TMC2209) where coarse_max can already
-            #     sit near the no-load value.
+                # Conservative: gap must be >=2x prior coarse baseline
+                # AND the absolute floor must be cleared. Avoids early
+                # noise-driven false positives.
+                gap_ratio_threshold = (
+                    self.profile.COARSE_GAP_JUMP_RATIO)
+                gap_abs_floor = (
+                    self.profile.COARSE_GAP_JUMP_ABS_FLOOR)
+            else:
+                # Bisect/verify: legacy a/b paths below
+                gap_ratio_threshold = 0
+                gap_abs_floor = 0
+
             absolute_floor = (self.profile.SG_MAX_ABS_GAP
                               if self.sg2_driver
                               else self.profile.SG_MAX_ABS_GAP_SG4)
@@ -3752,6 +3769,41 @@ new Chart(document.getElementById('cvChart'), {
                                / max(median_coarse_max, 1))
             ratio_vs_med = last_max / max(last_med, 1)
             big_gap = (last_max - last_med) >= self.profile.SG_MAX_BIG_GAP
+
+            # COARSE: gap-jump path — most sensitive to the
+            #         stick-slip-with-compact-median signature.
+            # Requires TWO consecutive steps with elevated gaps to
+            # avoid false-positives from a single-sample sg_max
+            # outlier (one stray spike in 564 samples = 0.18 % of
+            # the signal which is just noise, not real slip).
+            if phase == 'coarse':
+                # Compute previous step's gap if it exists
+                prev_gap = 0
+                if len(coarse_maxes) >= 2 and len(coarse_meds) >= 2:
+                    # coarse_maxes[-1] is the second-most-recent step
+                    prev_gap = coarse_maxes[-1] - coarse_meds[-1]
+                # Both prev and current must be ratio*baseline above
+                # the historical baseline AND clear the absolute floor.
+                prev_ratio = prev_gap / max(baseline_gap, 1)
+                cur_ratio = current_gap / max(baseline_gap, 1)
+                if (baseline_gap > 0
+                        and cur_ratio >= gap_ratio_threshold
+                        and prev_ratio >= gap_ratio_threshold
+                        and current_gap >= gap_abs_floor
+                        and prev_gap >= gap_abs_floor *
+                            self.profile.COARSE_GAP_JUMP_PREV_FRACTION):
+                    return ("%s max-median gap %.0f in this step is "
+                            "%.1fx the prior coarse baseline (%.0f), "
+                            "with the previous step (gap %.0f) also "
+                            "elevated — persistent stall-recovery "
+                            "spikes inside the runs (motor decoupling)"
+                            % (sg_label, current_gap, cur_ratio,
+                               baseline_gap, prev_gap))
+                # Coarse stops here (don't fire on the bisect/verify
+                # paths below)
+                return None
+
+            # BISECT/VERIFY: legacy two-path detection
             fires_a = (ratio_vs_med >= self.profile.SG_MAX_RATIO_TO_MEDIAN
                        and ratio_vs_coarse >=
                             self.profile.SG_MAX_RATIO_TO_COARSE
