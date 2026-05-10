@@ -8,6 +8,8 @@
 #   - symlinks the plugin into Klipper's extras directory
 #     (symlink, not file copy, so Klipper's repo stays clean)
 #   - clears stale Python cache
+#   - installs the Mainsail/Fluidd macros file (copy, not symlink)
+#     and adds the [include] directive to printer.cfg
 #   - registers the plugin with Moonraker's update manager
 #   - restarts Klipper (and Moonraker, if installed)
 
@@ -132,6 +134,83 @@ EOF
     printf "[INSTALL] Update manager block added!\n\n"
 }
 
+function install_macros {
+    local macros_src="${REPO_DIR}/tmc_flow_test_macros.cfg"
+    local macros_dst="${USER_CONFIG_PATH}/tmc_flow_test_macros.cfg"
+
+    if [ ! -f "${macros_src}" ]; then
+        echo "[INFO] No macros file found in repo (tmc_flow_test_macros.cfg)"
+        echo "[INFO] Skipping macros install."
+        printf "\n"
+        return 0
+    fi
+
+    if [ ! -d "${USER_CONFIG_PATH}" ]; then
+        echo "[INFO] Klipper config directory ${USER_CONFIG_PATH} not found."
+        echo "[INFO] Skipping macros install."
+        printf "\n"
+        return 0
+    fi
+
+    if [ -f "${macros_dst}" ]; then
+        # Don't overwrite — user may have customized.
+        # Compare hashes to tell user if there's a newer version.
+        local src_hash dst_hash
+        src_hash=$(md5sum "${macros_src}" | awk '{print $1}')
+        dst_hash=$(md5sum "${macros_dst}" | awk '{print $1}')
+        if [ "${src_hash}" = "${dst_hash}" ]; then
+            printf "[INSTALL] Macros file already up-to-date.\n\n"
+        else
+            echo "[INSTALL] Macros file already exists at"
+            echo "          ${macros_dst}"
+            echo "          but differs from the repo version."
+            echo "          NOT overwriting (you may have customized it)."
+            echo "          To force-update, delete the file and re-run install.sh."
+            printf "\n"
+        fi
+        return 0
+    fi
+
+    echo "[INSTALL] Copying macros file to printer config directory..."
+    cp "${macros_src}" "${macros_dst}"
+    printf "[INSTALL] Macros installed at ${macros_dst}\n\n"
+}
+
+function add_include_to_printer_cfg {
+    local printer_cfg="${USER_CONFIG_PATH}/printer.cfg"
+    local include_line="[include tmc_flow_test_macros.cfg]"
+
+    if [ ! -f "${printer_cfg}" ]; then
+        echo "[INFO] printer.cfg not found at ${printer_cfg}"
+        echo "[INFO] Skipping printer.cfg edit."
+        printf "\n"
+        return 0
+    fi
+
+    # Already present? skip.
+    if grep -qF "${include_line}" "${printer_cfg}"; then
+        printf "[INSTALL] [include tmc_flow_test_macros.cfg] already in printer.cfg\n\n"
+        return 0
+    fi
+
+    # Backup before edit
+    local backup="${printer_cfg}.bak.$(date +%Y%m%d-%H%M%S)"
+    cp "${printer_cfg}" "${backup}"
+    echo "[INSTALL] Backing up printer.cfg to ${backup}"
+
+    # Prepend the include directive at the top of the file.
+    # We insert as the first line so the macros are included before
+    # any other section. Klipper accepts include anywhere but "at top"
+    # is the convention.
+    local tmp="${printer_cfg}.tmp.$$"
+    {
+        echo "${include_line}"
+        cat "${printer_cfg}"
+    } > "${tmp}"
+    mv "${tmp}" "${printer_cfg}"
+    printf "[INSTALL] Added [include tmc_flow_test_macros.cfg] to top of printer.cfg\n\n"
+}
+
 function restart_klipper {
     echo "[POST-INSTALL] Restarting Klipper..."
     sudo systemctl restart klipper
@@ -156,6 +235,8 @@ preflight_checks
 validate_plugin_syntax
 link_module
 clear_pycache
+install_macros
+add_include_to_printer_cfg
 add_updater
 restart_klipper
 restart_moonraker
