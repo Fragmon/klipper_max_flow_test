@@ -109,6 +109,9 @@ class TriggerProfile:
     SG_MAX_ABS_GAP_SG4 = 150        # absolute gap floor (sg4 chips)
     SG_MAX_BIG_RATIO = 4.0          # alt path — extreme ratio
     SG_MAX_BIG_GAP = 300            # alt path — extreme gap
+    # ─── _check_sg_max_spike COARSE-phase thresholds ──────────────
+    COARSE_GAP_JUMP_RATIO = 2.0      # current gap >= 2x prior baseline gap
+    COARSE_GAP_JUMP_ABS_FLOOR = 350  # current gap must clear this absolute floor
     # Inverse direction (rare case where SG rises with load)
     SG_MIN_RATIO_TO_MEDIAN = 3.0
     SG_MIN_ABS_GAP = 80
@@ -281,6 +284,8 @@ class TMC2209Profile(TriggerProfile):
     SG_JUMP_THRESHOLD = 99999       # disable sudden-jump trigger
     SG_MAX_SPIKE_RATIO = 99.0       # disable max-spike (decoupling) trigger
     SG_MAX_SPIKE_RATIO_BISECT = 99.0
+    COARSE_GAP_JUMP_RATIO = 99.0     # disable coarse gap-jump for SG4
+    COARSE_GAP_JUMP_ABS_FLOOR = 99999
     PLATEAU_RATIO = 0.0             # 0 → never fire plateau
     PLATEAU_SATURATION_SKIP = 0     # n/a since plateau disabled
 
@@ -3663,8 +3668,7 @@ new Chart(document.getElementById('cvChart'), {
         if last.get('phase') not in ('bisect', 'verify'):
             return None
         sg = last.get('sg') or {}
-        if 'max' not in sg or 'min' not in sg or 'median' not in sg:
-            return None
+        phase = last.get('phase', 'coarse')
         last_max = sg['max']
         last_min = sg['min']
         last_med = sg['median']
@@ -3686,7 +3690,12 @@ new Chart(document.getElementById('cvChart'), {
             if 'median' in sg_p:
                 coarse_meds.append(sg_p['median'])
         if len(coarse_maxes) < 4 or len(coarse_meds) < 4:
-            return None
+            if (phase == 'coarse'
+                    and len(coarse_maxes) >= 3
+                    and len(coarse_meds) >= 3):
+                pass
+            else:
+                return None
 
         # Determine SG-vs-load trend direction: compare first vs last
         # coarse-phase median (excluding the last coarse step which
@@ -3710,6 +3719,25 @@ new Chart(document.getElementById('cvChart'), {
             # Normal case for all common driver setups. Decoupling →
             # SG snaps UP. Compare sg_max to typical coarse sg_max.
             median_coarse_max = _median(coarse_maxes[:-1])
+            prior_gaps = [m - md for m, md in zip(coarse_maxes[:-1],
+                                                  coarse_meds[:-1])
+                          if m > md]
+            baseline_gap = _median(prior_gaps) if prior_gaps else 0
+            current_gap = last_max - last_med
+            if phase == 'coarse':
+                if (baseline_gap > 0
+                        and current_gap >=
+                            baseline_gap * self.profile.COARSE_GAP_JUMP_RATIO
+                        and current_gap >=
+                            self.profile.COARSE_GAP_JUMP_ABS_FLOOR):
+                    return ("%s max-median gap %.0f in this step is "
+                            "%.1fx the prior coarse baseline (%.0f) "
+                            "— stall-recovery spikes inside the run "
+                            "(motor decoupling)"
+                            % (sg_label, current_gap,
+                               current_gap / max(baseline_gap, 1),
+                               baseline_gap))
+                return None
             # Two paths to fire:
             # (a) Strong ratio + above coarse: max is dramatically
             #     above median AND clearly above what coarse saw.
