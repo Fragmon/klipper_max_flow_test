@@ -134,6 +134,23 @@ class TriggerProfile:
     COARSE_GAP_JUMP_RATIO = 2.0      # current gap >= 2x prior baseline gap
     COARSE_GAP_JUMP_ABS_FLOOR = 350  # current gap must clear this absolute floor
     COARSE_GAP_JUMP_PREV_FRACTION = 0.7  # prev step's gap must also be ≥ 0.7×floor
+
+    # ─── Composite "soft-stall" trigger — coarse phase only ───────
+    # Detects soft stalls where IQR and sg_max-gap both rise modestly
+    # at the same step but neither alone hits the gap-jump or
+    # iqr-spread thresholds. This pattern shows up in stick-slip
+    # stalls where the motor partially loses grip without snapping
+    # back to no-load (so sg_max stays small but variance grows).
+    # Requires BOTH conditions to be elevated simultaneously, which
+    # is essentially never the case for noise — the warmup-spike
+    # protection comes from MIN_HISTORY (≥5 prior coarse steps).
+    COMPOSITE_IQR_RATIO = 1.5        # iqr ≥ 1.5x its coarse-baseline
+    COMPOSITE_IQR_ABS_FLOOR = 5      # iqr must be ≥ 5 raw units
+    COMPOSITE_GAP_RATIO = 1.5        # gap ≥ 1.5x its coarse-baseline
+    COMPOSITE_GAP_ABS_FLOOR = 10     # gap must be ≥ 10 raw units
+    COMPOSITE_MIN_HISTORY = 5        # need ≥ 5 prior coarse steps
+    COMPOSITE_BASELINE_TRIM = 2      # drop top-N gap outliers when
+                                     # computing baseline (warmup spikes)
     # Inverse direction (rare case where SG rises with load)
     SG_MIN_RATIO_TO_MEDIAN = 3.0
     SG_MIN_ABS_GAP = 80
@@ -309,6 +326,11 @@ class TMC2209Profile(TriggerProfile):
     COARSE_GAP_JUMP_RATIO = 99.0     # disable coarse gap-jump for SG4
     COARSE_GAP_JUMP_ABS_FLOOR = 99999
     COARSE_GAP_JUMP_PREV_FRACTION = 99.0
+    # Composite trigger disabled for SG4 — different noise floor
+    COMPOSITE_IQR_RATIO = 99.0
+    COMPOSITE_GAP_RATIO = 99.0
+    COMPOSITE_IQR_ABS_FLOOR = 99999
+    COMPOSITE_GAP_ABS_FLOOR = 99999
     PLATEAU_RATIO = 0.0             # 0 → never fire plateau
     PLATEAU_SATURATION_SKIP = 0     # n/a since plateau disabled
 
@@ -3631,6 +3653,16 @@ new Chart(document.getElementById('cvChart'), {
         if iqr_reason:
             return iqr_reason
 
+        # Trigger 4b: composite soft-stall — coarse phase only.
+        # Catches partial / stick-slip stalls where IQR and the
+        # sg_max-median gap BOTH rise modestly at the same step but
+        # neither individually triggers. Two independent rises ARE
+        # the signal.
+        composite_reason = self._check_soft_stall_composite(
+            results, sg_label)
+        if composite_reason:
+            return composite_reason
+
         # Trigger 5: SG max spike — bisection / verify only. Catches
         # decoupling events where one of the repeats briefly snaps SG
         # to its no-load value, but the median absorbs it.
@@ -3968,6 +4000,93 @@ new Chart(document.getElementById('cvChart'), {
                                median_coarse_iqr,
                                last_iqr / median_coarse_iqr,
                                last_cv, median_coarse_cv))
+
+        return None
+
+    def _check_soft_stall_composite(self, results, sg_label):
+        """Coarse-phase composite trigger for soft / stick-slip stalls.
+
+        Some stalls don't snap sg_max far above the median (so the
+        gap-jump trigger misses them) and don't push IQR above the
+        spread-trigger's strict threshold either — but BOTH indicators
+        rise modestly and simultaneously. That's the signature of a
+        partial-stall where the motor briefly loses some of the load
+        without fully decoupling.
+
+        Fires when, all at once:
+          * IQR ≥ 1.5x its coarse baseline AND IQR ≥ 5 raw units
+          * sg_max-median gap ≥ 1.5x its coarse baseline AND gap ≥ 10
+
+        The combination is essentially never noise: motors don't
+        spontaneously develop both IQR widening and gap-elevation
+        unless something is genuinely changing. False-positive
+        protection comes from MIN_HISTORY (need 5+ prior coarse
+        steps) and from trimming warm-up spikes out of the baseline.
+
+        Coarse-only. Bisect/verify have their own (tighter)
+        triggers, and reusing the soft-stall criterion there would
+        be redundant.
+        """
+        last = results[-1]
+        if last.get('phase', 'coarse') != 'coarse':
+            return None
+
+        sg = last.get('sg') or {}
+        if ('p25' not in sg or 'p75' not in sg
+                or 'max' not in sg or 'median' not in sg):
+            return None
+        last_iqr = sg['p75'] - sg['p25']
+        last_gap = sg['max'] - sg['median']
+
+        # Gather IQR and gap from prior coarse steps only
+        prior_iqrs = []
+        prior_gaps = []
+        for r in results[:-1]:
+            if r.get('phase', 'coarse') != 'coarse':
+                continue
+            psg = r.get('sg') or {}
+            if 'p25' in psg and 'p75' in psg:
+                prior_iqrs.append(psg['p75'] - psg['p25'])
+            if 'max' in psg and 'median' in psg:
+                prior_gaps.append(psg['max'] - psg['median'])
+
+        if (len(prior_iqrs) < self.profile.COMPOSITE_MIN_HISTORY
+                or len(prior_gaps) < self.profile.COMPOSITE_MIN_HISTORY):
+            return None
+
+        # Trim warmup-style outlier gaps from the baseline. The first
+        # few coarse steps sometimes see big sg_max excursions while
+        # the system settles. Dropping the top-N largest gaps gives
+        # us a more representative "typical" baseline.
+        trim_n = self.profile.COMPOSITE_BASELINE_TRIM
+        if len(prior_gaps) >= (trim_n + 4):
+            gaps_clean = sorted(prior_gaps)[:-trim_n]
+        else:
+            gaps_clean = prior_gaps
+
+        def _median(xs):
+            s = sorted(xs); n = len(s)
+            return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+        iqr_base = _median(prior_iqrs)
+        gap_base = _median(gaps_clean)
+
+        # Avoid division-by-zero on extremely clean signals
+        iqr_ratio = last_iqr / max(iqr_base, 0.5)
+        gap_ratio = last_gap / max(gap_base, 1.0)
+
+        iqr_elevated = (iqr_ratio >= self.profile.COMPOSITE_IQR_RATIO
+                        and last_iqr >= self.profile.COMPOSITE_IQR_ABS_FLOOR)
+        gap_elevated = (gap_ratio >= self.profile.COMPOSITE_GAP_RATIO
+                        and last_gap >= self.profile.COMPOSITE_GAP_ABS_FLOOR)
+
+        if iqr_elevated and gap_elevated:
+            return ("%s composite stall: IQR %.0f (%.1fx baseline %.0f) "
+                    "and max-median gap %.0f (%.1fx baseline %.0f) both "
+                    "elevated simultaneously — partial-stall / "
+                    "stick-slip signature"
+                    % (sg_label, last_iqr, iqr_ratio, iqr_base,
+                       last_gap, gap_ratio, gap_base))
 
         return None
 
